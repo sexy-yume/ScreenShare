@@ -138,11 +138,12 @@ namespace ScreenShare.Client.Capture
         private void CaptureLoop()
         {
             Stopwatch frameTimer = new Stopwatch();
-            int targetFrameTime = 1000 / _fps;
+            
 
             while (_capturing)
             {
                 frameTimer.Restart();
+                int targetFrameTime = 1000 / _fps;
                 try
                 {
                     // 화면 캡처
@@ -189,6 +190,7 @@ namespace ScreenShare.Client.Capture
                         double seconds = _fpsTimer.ElapsedMilliseconds / 1000.0;
                         double fps = _frameCount / seconds;
                         FileLogger.Instance.WriteInfo($"캡처 FPS: {fps:F1}, 총 프레임: {_frameCount}");
+                        
                         _frameCount = 0;
                         _fpsTimer.Restart();
                     }
@@ -196,8 +198,12 @@ namespace ScreenShare.Client.Capture
                     // 프레임 레이트 조절
                     int elapsed = (int)frameTimer.ElapsedMilliseconds;
                     int sleepTime = Math.Max(0, targetFrameTime - elapsed);
+
                     if (sleepTime > 0)
+                    {
+                        FileLogger.Instance.WriteInfo($"sleepTime : {sleepTime}");
                         Thread.Sleep(sleepTime);
+                    }
                 }
                 catch (Exception ex)
                 {
