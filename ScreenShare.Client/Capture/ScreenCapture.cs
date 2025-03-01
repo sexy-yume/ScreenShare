@@ -287,7 +287,7 @@ namespace ScreenShare.Client.Capture
                 Bitmap bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
 
                 BitmapData bitmapData = bitmap.LockBits(
-                    new Rectangle(0, 0, width, height),
+                    new System.Drawing.Rectangle(0, 0, width, height),
                     ImageLockMode.WriteOnly,
                     PixelFormat.Format32bppArgb);
 

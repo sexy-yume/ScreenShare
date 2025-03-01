@@ -89,6 +89,7 @@ namespace ScreenShare.Host.Decoder
             }
         }
 
+        // FFmpegDecoder.cs의 DecodeFrame 메서드 수정
         public void DecodeFrame(byte[] data, int width, int height)
         {
             if (_isDisposed || data == null || data.Length == 0)
@@ -97,6 +98,7 @@ namespace ScreenShare.Host.Decoder
             lock (_decodeLock)
             {
                 Stopwatch sw = Stopwatch.StartNew();
+                Console.WriteLine($"디코딩 시작: 데이터 크기={data.Length}, 목표 해상도={width}x{height}");
 
                 try
                 {
@@ -135,22 +137,34 @@ namespace ScreenShare.Host.Decoder
                         if (ret < 0)
                         {
                             string errorMsg = GetErrorMessage(ret);
-                            Console.WriteLine($"패킷 디코딩 실패: {errorMsg}");
+                            Console.WriteLine($"패킷 디코딩 실패: {errorMsg}, 코드: {ret}");
                             return;
                         }
+
+                        Console.WriteLine("패킷 전송 성공, 프레임 수신 대기");
+                        bool frameReceived = false;
 
                         while (ret >= 0)
                         {
                             ret = ffmpeg.avcodec_receive_frame(_context, _frame);
                             if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF)
+                            {
+                                Console.WriteLine($"더 이상 프레임 없음: {(ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) ? "EAGAIN" : "EOF")}");
                                 break;
+                            }
 
                             if (ret < 0)
                             {
                                 string errorMsg = GetErrorMessage(ret);
-                                Console.WriteLine($"프레임 수신 실패: {errorMsg}");
+                                Console.WriteLine($"프레임 수신 실패: {errorMsg}, 코드: {ret}");
                                 break;
                             }
+
+                            Console.WriteLine($"프레임 수신 성공: 포맷={_frame->format}, 크기={_frame->width}x{_frame->height}");
+                            frameReceived = true;
+
+                            // 디코딩된 프레임 정보 출력
+                            Console.WriteLine($"YUV 데이터: Y_linesize={_frame->linesize[0]}, U_linesize={_frame->linesize[1]}, V_linesize={_frame->linesize[2]}");
 
                             // 비트맵 생성
                             var bitmap = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
@@ -174,14 +188,28 @@ namespace ScreenShare.Host.Decoder
                             int_array4 dstStrides = new int_array4();
                             dstStrides[0] = bitmapData.Stride;
 
-                            ffmpeg.sws_scale(_swsContext, srcDataPtr, srcStrides, 0, height, dstDataPtr, dstStrides);
+                            int scaleResult = ffmpeg.sws_scale(_swsContext, srcDataPtr, srcStrides, 0, height, dstDataPtr, dstStrides);
+                            Console.WriteLine($"변환된 라인 수: {scaleResult}");
 
                             bitmap.UnlockBits(bitmapData);
 
+                            // 디버깅용 - 시간 표시
+                            using (Graphics g = Graphics.FromImage(bitmap))
+                            {
+                                g.DrawString(DateTime.Now.ToString("HH:mm:ss.fff"),
+                                    new Font("Arial", 12), Brushes.Yellow, 10, 10);
+                            }
+
                             _frameCount++;
+                            Console.WriteLine($"비트맵 생성 완료: 해상도={bitmap.Width}x{bitmap.Height}, 포맷={bitmap.PixelFormat}");
 
                             // 이벤트 발생
                             FrameDecoded?.Invoke(this, bitmap);
+                        }
+
+                        if (!frameReceived)
+                        {
+                            Console.WriteLine("유효한 프레임이 디코딩되지 않았습니다. 다음 패킷을 기다립니다.");
                         }
                     }
 
@@ -193,7 +221,7 @@ namespace ScreenShare.Host.Decoder
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"디코딩 오류: {ex.Message}");
+                    Console.WriteLine($"디코딩 오류: {ex.Message}\n{ex.StackTrace}");
                 }
             }
         }
