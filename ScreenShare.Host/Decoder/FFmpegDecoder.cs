@@ -46,6 +46,7 @@ namespace ScreenShare.Host.Decoder
             return Encoding.UTF8.GetString(buffer).TrimEnd('\0');
         }
 
+        // FFmpegDecoder.cs의 InitializeFFmpeg 메소드에서 오류 수정
         private void InitializeFFmpeg()
         {
             try
@@ -62,9 +63,23 @@ namespace ScreenShare.Host.Decoder
                 _context->flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY;  // 낮은 지연 설정
                 _context->thread_count = 4;  // 멀티스레딩 설정
 
+                // H.264 세부 설정 추가
+                _context->flags2 |= ffmpeg.AV_CODEC_FLAG2_FAST; // 빠른 디코딩 활성화
+
                 // 코덱 열기
                 AVDictionary* opts = null;
                 ffmpeg.av_dict_set(&opts, "threads", "auto", 0);  // 멀티스레딩 활성화
+
+                // 중요: H.264 특화 옵션 추가
+                ffmpeg.av_dict_set(&opts, "refcounted_frames", "1", 0); // 참조 카운팅 프레임 사용
+
+                // H.264 디코딩 설정 추가
+                // 첫 I-프레임이 아니어도 디코딩 시작
+                ffmpeg.av_dict_set(&opts, "flags", "low_delay", 0);
+                ffmpeg.av_dict_set(&opts, "flags2", "fast", 0);
+
+                // 에러 감지 완화
+                _context->err_recognition = 0;
 
                 int result = ffmpeg.avcodec_open2(_context, _codec, &opts);
                 if (result < 0)
@@ -90,11 +105,12 @@ namespace ScreenShare.Host.Decoder
         }
 
         // FFmpegDecoder.cs의 DecodeFrame 메서드 수정
-        public void DecodeFrame(byte[] data, int width, int height)
+        public Bitmap DecodeFrame(byte[] data, int width, int height)
         {
             if (_isDisposed || data == null || data.Length == 0)
-                return;
+                return null;
 
+            Bitmap result = null;
             lock (_decodeLock)
             {
                 Stopwatch sw = Stopwatch.StartNew();
@@ -132,13 +148,18 @@ namespace ScreenShare.Host.Decoder
                         _packet->data = ptr;
                         _packet->size = data.Length;
 
+                        // 파싱 플래그 설정 및 시간 정보 설정
+                        _packet->flags = 0;
+                        _packet->pts = _frameCount;
+                        _packet->dts = _frameCount;
+
                         // 패킷 디코딩
                         int ret = ffmpeg.avcodec_send_packet(_context, _packet);
                         if (ret < 0)
                         {
                             string errorMsg = GetErrorMessage(ret);
                             Console.WriteLine($"패킷 디코딩 실패: {errorMsg}, 코드: {ret}");
-                            return;
+                            return null;
                         }
 
                         Console.WriteLine("패킷 전송 성공, 프레임 수신 대기");
@@ -167,8 +188,8 @@ namespace ScreenShare.Host.Decoder
                             Console.WriteLine($"YUV 데이터: Y_linesize={_frame->linesize[0]}, U_linesize={_frame->linesize[1]}, V_linesize={_frame->linesize[2]}");
 
                             // 비트맵 생성
-                            var bitmap = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-                            var bitmapData = bitmap.LockBits(
+                            result = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                            var bitmapData = result.LockBits(
                                 new Rectangle(0, 0, width, height),
                                 System.Drawing.Imaging.ImageLockMode.WriteOnly,
                                 System.Drawing.Imaging.PixelFormat.Format32bppArgb);
@@ -191,20 +212,13 @@ namespace ScreenShare.Host.Decoder
                             int scaleResult = ffmpeg.sws_scale(_swsContext, srcDataPtr, srcStrides, 0, height, dstDataPtr, dstStrides);
                             Console.WriteLine($"변환된 라인 수: {scaleResult}");
 
-                            bitmap.UnlockBits(bitmapData);
-
-                            // 디버깅용 - 시간 표시
-                            using (Graphics g = Graphics.FromImage(bitmap))
-                            {
-                                g.DrawString(DateTime.Now.ToString("HH:mm:ss.fff"),
-                                    new Font("Arial", 12), Brushes.Yellow, 10, 10);
-                            }
+                            result.UnlockBits(bitmapData);
 
                             _frameCount++;
-                            Console.WriteLine($"비트맵 생성 완료: 해상도={bitmap.Width}x{bitmap.Height}, 포맷={bitmap.PixelFormat}");
+                            Console.WriteLine($"비트맵 생성 완료: 해상도={result.Width}x{result.Height}, 포맷={result.PixelFormat}");
 
-                            // 이벤트 발생
-                            FrameDecoded?.Invoke(this, bitmap);
+                            // 프레임 수신 즉시 종료
+                            break;
                         }
 
                         if (!frameReceived)
@@ -224,6 +238,8 @@ namespace ScreenShare.Host.Decoder
                     Console.WriteLine($"디코딩 오류: {ex.Message}\n{ex.StackTrace}");
                 }
             }
+
+            return result;
         }
 
         public void Dispose()

@@ -11,7 +11,7 @@ namespace ScreenShare.Host.Forms
     {
         private NetworkServer _networkServer;
         private Panel _renderPanel;
-        private DirectXRenderer _renderer;
+        private SimplifiedDirectXRenderer _renderer; // Using the simplified renderer
         private Label _statusLabel;
         private int _clientNumber;
         private bool _isControlling;
@@ -28,36 +28,36 @@ namespace ScreenShare.Host.Forms
             _isControlling = true;
 
             InitializeComponent();
-            InitializeDirectXRenderer(initialImage);
+            InitializeRenderer(initialImage);
 
             FormClosing += (s, e) => Cleanup();
-            FileLogger.Instance.WriteInfo($"클라이언트 {clientNumber} 원격 제어 창 생성 (DirectX 렌더러 사용)");
+            FileLogger.Instance.WriteInfo($"Client {clientNumber} remote control window created (Simplified DirectX renderer)");
         }
 
         private void InitializeComponent()
         {
-            // 폼 설정
-            Text = $"원격 제어 - 클라이언트 {_clientNumber}";
+            // Form settings
+            Text = $"Remote Control - Client {_clientNumber}";
             Size = new Size(1024, 768);
             StartPosition = FormStartPosition.CenterScreen;
 
-            // 상태 표시 레이블
+            // Status label
             _statusLabel = new Label
             {
                 Dock = DockStyle.Bottom,
                 Height = 25,
                 TextAlign = ContentAlignment.MiddleCenter,
-                Text = "원격 제어 모드 - 마우스와 키보드 입력이 클라이언트에 전달됩니다."
+                Text = "Remote Control Mode - Mouse and keyboard inputs are sent to the client"
             };
 
-            // DirectX 렌더링을 위한 패널
+            // Rendering panel
             _renderPanel = new Panel
             {
                 Dock = DockStyle.Fill,
                 BackColor = Color.Black
             };
 
-            // 이벤트 핸들러 등록
+            // Event handlers
             _renderPanel.MouseMove += OnPanelMouseMove;
             _renderPanel.MouseClick += OnPanelMouseClick;
             _renderPanel.MouseDown += OnPanelMouseDown;
@@ -67,75 +67,80 @@ namespace ScreenShare.Host.Forms
             KeyDown += OnFormKeyDown;
             KeyUp += OnFormKeyUp;
 
-            // 컨트롤 추가
+            // Add controls
             Controls.Add(_renderPanel);
             Controls.Add(_statusLabel);
         }
 
-        private void InitializeDirectXRenderer(Bitmap initialImage)
+        private void InitializeRenderer(Bitmap initialImage)
         {
             try
             {
-                if (initialImage != null)
+                // Create default image if none provided
+                if (initialImage == null)
                 {
-                    lock (_frameLock)
-                    {
-                        _currentFrame = new Bitmap(initialImage);
-                    }
-                }
-                else
-                {
-                    // 초기 이미지가 없을 경우 대기 메시지 표시
-                    lock (_frameLock)
-                    {
-                        _currentFrame = new Bitmap(800, 600);
-                        using (Graphics g = Graphics.FromImage(_currentFrame))
-                        {
-                            g.Clear(Color.Black);
-                            g.DrawString("화면 데이터 수신 대기중...",
-                                new Font("Arial", 24), Brushes.White,
-                                new RectangleF(0, 0, 800, 600),
-                                new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center });
-                        }
-                    }
+                    initialImage = CreateWaitingImage();
                 }
 
-                // 렌더러 초기화
-                if (_currentFrame != null)
+                // Store a copy of the initial image
+                lock (_frameLock)
                 {
-                    _renderer = new DirectXRenderer(_renderPanel, _currentFrame.Width, _currentFrame.Height);
-
-                    // SetBackgroundColor의 경우 System.Drawing.Color 타입을 명시적으로 전달
-                    Color backgroundColor = Color.Black;
-                    _renderer.SetBackgroundColor(backgroundColor);
-
-                    _renderer.SetStretchMode(true);
-                    _renderer.SetVSync(false); // VSync 비활성화로 저지연 구현
+                    _currentFrame = new Bitmap(initialImage);
                 }
+
+                // Initialize the simplified DirectX renderer
+                _renderer = new SimplifiedDirectXRenderer(_renderPanel, initialImage.Width, initialImage.Height);
+
+                // Render the initial frame
+                _renderer.RenderFrame(_currentFrame);
+
+                FileLogger.Instance.WriteInfo($"Renderer initialized with {initialImage.Width}x{initialImage.Height} image");
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("DirectX 렌더러 초기화 실패", ex);
-                MessageBox.Show($"DirectX 렌더러 초기화 중 오류가 발생했습니다: {ex.Message}", "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                FileLogger.Instance.WriteError("Failed to initialize renderer", ex);
+                MessageBox.Show($"Error initializing renderer: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        private Bitmap CreateWaitingImage()
+        {
+            // Create a simple "waiting" image
+            Bitmap waitingImage = new Bitmap(800, 600);
+            using (Graphics g = Graphics.FromImage(waitingImage))
+            {
+                g.Clear(Color.DarkBlue);
+
+                // Add text
+                using (Font font = new Font("Arial", 24, FontStyle.Bold))
+                {
+                    string message = "Waiting for screen data...";
+                    SizeF textSize = g.MeasureString(message, font);
+                    PointF textPosition = new PointF(
+                        (waitingImage.Width - textSize.Width) / 2,
+                        (waitingImage.Height - textSize.Height) / 2);
+
+                    g.DrawString(message, font, Brushes.White, textPosition);
+                }
+
+                // Draw colored rectangles in the corners for testing
+                g.FillRectangle(Brushes.Red, 0, 0, 50, 50);
+                g.FillRectangle(Brushes.Green, waitingImage.Width - 50, 0, 50, 50);
+                g.FillRectangle(Brushes.Blue, 0, waitingImage.Height - 50, 50, 50);
+                g.FillRectangle(Brushes.Yellow, waitingImage.Width - 50, waitingImage.Height - 50, 50, 50);
+            }
+
+            return waitingImage;
         }
 
         public void UpdateImage(Bitmap image)
         {
-            if (_isDisposed)
+            if (_isDisposed || image == null)
                 return;
 
             try
             {
-                Console.WriteLine($"이미지 업데이트 시작: image={image != null}");
-                if (image != null)
-                {
-                    Console.WriteLine($"이미지 정보: {image.Width}x{image.Height}, Format={image.PixelFormat}");
-                }
-
-                Bitmap frameToRender = null;
-
-                // 이전 프레임 정리 및 새 프레임 설정
+                // Replace the current frame
                 lock (_frameLock)
                 {
                     if (_currentFrame != null && _currentFrame != image)
@@ -143,126 +148,30 @@ namespace ScreenShare.Host.Forms
                         _currentFrame.Dispose();
                     }
 
-                    if (image != null)
-                    {
-                        _currentFrame = image;
-                        frameToRender = _currentFrame;
-                    }
-                    else
-                    {
-                        // 테스트 이미지 생성
-                        frameToRender = CreateTestImage();
-                    }
+                    _currentFrame = image;
                 }
 
-                // UI 스레드에서 렌더링 실행
-                if (frameToRender != null)
+                // Render on UI thread
+                if (InvokeRequired)
                 {
-                    if (InvokeRequired)
-                    {
-                        BeginInvoke(new Action(() => RenderCurrentFrame(frameToRender)));
-                    }
-                    else
-                    {
-                        RenderCurrentFrame(frameToRender);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                FileLogger.Instance.WriteError("화면 업데이트 오류", ex);
-                Console.WriteLine($"화면 업데이트 상세 오류: {ex.StackTrace}");
-            }
-        }
-        private Bitmap CreateTestImage()
-        {
-            Console.WriteLine("테스트 이미지 생성 중...");
-
-            int width = 800;
-            int height = 600;
-
-            if (_currentFrame != null)
-            {
-                width = _currentFrame.Width;
-                height = _currentFrame.Height;
-            }
-
-            Bitmap testImage = new Bitmap(width, height);
-
-            using (Graphics g = Graphics.FromImage(testImage))
-            {
-                // 배경색 채우기
-                g.Clear(Color.DarkBlue);
-
-                // 테스트 패턴 그리기
-                for (int x = 0; x < width; x += 100)
-                {
-                    for (int y = 0; y < height; y += 100)
-                    {
-                        bool isEvenX = (x / 100) % 2 == 0;
-                        bool isEvenY = (y / 100) % 2 == 0;
-
-                        Color color = (isEvenX ^ isEvenY) ? Color.LightGray : Color.DarkGray;
-                        g.FillRectangle(new SolidBrush(color), x, y, 100, 100);
-                    }
-                }
-
-                // 텍스트 추가
-                g.DrawString("테스트 화면 - " + DateTime.Now.ToString("HH:mm:ss.fff"),
-                    new Font("Arial", 24, FontStyle.Bold),
-                    Brushes.Yellow, 50, 50);
-
-                g.DrawString("화면 데이터가 없거나 렌더링 문제가 있습니다.",
-                    new Font("Arial", 18),
-                    Brushes.White, 50, 100);
-            }
-
-            Console.WriteLine("테스트 이미지 생성 완료");
-            return testImage;
-        }
-        private void RenderCurrentFrame(Bitmap frame)
-        {
-            try
-            {
-                if (!_isDisposed && _renderer != null && frame != null)
-                {
-                    Console.WriteLine($"프레임 렌더링 시작: {frame.Width}x{frame.Height}, Format={frame.PixelFormat}");
-
-                    // 확실히 하기 위해 새 비트맵으로 복사
-                    using (var copy = new Bitmap(frame))
-                    {
-                        // 테스트 - 비트맵에 텍스트 그리기 (화면에 나타나는지 확인용)
-                        using (Graphics g = Graphics.FromImage(copy))
+                    BeginInvoke(new Action(() => {
+                        if (!_isDisposed && _renderer != null && _currentFrame != null)
                         {
-                            g.DrawString(DateTime.Now.ToString("HH:mm:ss.fff"),
-                                new Font("Arial", 24, FontStyle.Bold),
-                                Brushes.Red, 10, 10);
-
-                            // 테스트 패턴 - 화면 모서리에 색상 사각형 그리기
-                            g.FillRectangle(Brushes.Red, 0, 0, 50, 50);
-                            g.FillRectangle(Brushes.Green, copy.Width - 50, 0, 50, 50);
-                            g.FillRectangle(Brushes.Blue, 0, copy.Height - 50, 50, 50);
-                            g.FillRectangle(Brushes.Yellow, copy.Width - 50, copy.Height - 50, 50, 50);
+                            _renderer.RenderFrame(_currentFrame);
                         }
-
-                        _renderer.RenderFrame(copy);
-                        Console.WriteLine("프레임 렌더링 완료");
-                    }
+                    }));
                 }
                 else
                 {
-                    Console.WriteLine($"프레임 렌더링 스킵: isDisposed={_isDisposed}, renderer={_renderer != null}, frame={frame != null}");
-                    if (_renderer != null && frame == null)
+                    if (!_isDisposed && _renderer != null && _currentFrame != null)
                     {
-                        // null 비트맵을 전달해 빨간색 테스트 화면 표시
-                        _renderer.RenderFrame(null);
+                        _renderer.RenderFrame(_currentFrame);
                     }
                 }
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError($"DirectX 렌더링 오류: {ex.Message}", ex);
-                Console.WriteLine($"DirectX 렌더링 상세 오류: {ex.StackTrace}");
+                FileLogger.Instance.WriteError("Error updating image", ex);
             }
         }
 
@@ -273,7 +182,7 @@ namespace ScreenShare.Host.Forms
 
             try
             {
-                // 좌표 변환
+                // Convert coordinates
                 float scaleX = (float)_currentFrame.Width / _renderPanel.ClientSize.Width;
                 float scaleY = (float)_currentFrame.Height / _renderPanel.ClientSize.Height;
 
@@ -284,7 +193,7 @@ namespace ScreenShare.Host.Forms
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("마우스 이동 전송 오류", ex);
+                FileLogger.Instance.WriteError("Error sending mouse move", ex);
             }
         }
 
@@ -295,7 +204,7 @@ namespace ScreenShare.Host.Forms
 
             try
             {
-                // 좌표 변환
+                // Convert coordinates
                 float scaleX = (float)_currentFrame.Width / _renderPanel.ClientSize.Width;
                 float scaleY = (float)_currentFrame.Height / _renderPanel.ClientSize.Height;
 
@@ -306,12 +215,11 @@ namespace ScreenShare.Host.Forms
                 if (button >= 0)
                 {
                     _networkServer.SendMouseClick(_clientNumber, x, y, button);
-                    FileLogger.Instance.WriteInfo($"마우스 클릭 전송: 좌표 ({x},{y}), 버튼 {button}");
                 }
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("마우스 클릭 전송 오류", ex);
+                FileLogger.Instance.WriteError("Error sending mouse click", ex);
             }
         }
 
@@ -322,7 +230,7 @@ namespace ScreenShare.Host.Forms
 
         private void OnPanelMouseUp(object sender, MouseEventArgs e)
         {
-            // 필요한 경우 마우스 업 이벤트 처리
+            // Handle if needed
         }
 
         private void OnFormKeyDown(object sender, KeyEventArgs e)
@@ -335,12 +243,12 @@ namespace ScreenShare.Host.Forms
                 _networkServer.SendKeyPress(_clientNumber, (int)e.KeyCode);
                 e.Handled = true;
 
-                // ESC 키로 원격 제어 종료 기능 추가
+                // ESC key to exit remote control
                 if (e.KeyCode == Keys.Escape)
                 {
                     DialogResult result = MessageBox.Show(
-                        "원격 제어를 종료하시겠습니까?",
-                        "원격 제어 종료",
+                        "End remote control?",
+                        "End Remote Control",
                         MessageBoxButtons.YesNo,
                         MessageBoxIcon.Question);
 
@@ -352,13 +260,13 @@ namespace ScreenShare.Host.Forms
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("키 입력 전송 오류", ex);
+                FileLogger.Instance.WriteError("Error sending key press", ex);
             }
         }
 
         private void OnFormKeyUp(object sender, KeyEventArgs e)
         {
-            // 필요한 경우 키 업 이벤트 처리
+            // Handle if needed
         }
 
         private void Cleanup()
@@ -371,8 +279,11 @@ namespace ScreenShare.Host.Forms
 
             try
             {
-                _renderer?.Dispose();
-                _renderer = null;
+                if (_renderer != null)
+                {
+                    _renderer.Dispose();
+                    _renderer = null;
+                }
 
                 lock (_frameLock)
                 {
@@ -383,11 +294,11 @@ namespace ScreenShare.Host.Forms
                     }
                 }
 
-                FileLogger.Instance.WriteInfo($"클라이언트 {_clientNumber} 원격 제어 종료");
+                FileLogger.Instance.WriteInfo($"Client {_clientNumber} remote control ended");
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("원격 제어 창 종료 중 오류", ex);
+                FileLogger.Instance.WriteError("Error during cleanup", ex);
             }
         }
 

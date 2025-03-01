@@ -9,6 +9,7 @@ using ScreenShare.Common.Settings;
 using ScreenShare.Host.Decoder;
 using ScreenShare.Host.Network;
 using ScreenShare.Common.Utils;
+using System.Linq;
 
 namespace ScreenShare.Host.Forms
 {
@@ -17,8 +18,9 @@ namespace ScreenShare.Host.Forms
         private HostSettings _settings;
         private NetworkServer _networkServer;
         private System.Windows.Forms.Timer _networkUpdateTimer;
-        private ConcurrentDictionary<int, FFmpegDecoder> _decoders;
-        private ConcurrentDictionary<int, Bitmap> _lastFrames;
+        private ConcurrentDictionary<int, RemoteControlForm> _remoteControlForms = new ConcurrentDictionary<int, RemoteControlForm>();
+        private ConcurrentDictionary<int, FFmpegDecoder> _decoders = new ConcurrentDictionary<int, FFmpegDecoder>();
+        private ConcurrentDictionary<int, Bitmap> _lastFrames = new ConcurrentDictionary<int, Bitmap>();
         private List<ClientTile> _clientTiles;
         private int _tileWidth = 256;
         private int _tileHeight = 144;
@@ -93,22 +95,38 @@ namespace ScreenShare.Host.Forms
 
         private void Cleanup()
         {
-            _networkUpdateTimer?.Stop();
-            _networkServer?.Stop();
-
-            foreach (var decoder in _decoders.Values)
+            try
             {
-                decoder.Dispose();
-            }
+                // 원격 제어 폼 정리
+                foreach (var form in _remoteControlForms.Values)
+                {
+                    form.Close();
+                    form.Dispose();
+                }
+                _remoteControlForms.Clear();
 
-            foreach (var frame in _lastFrames.Values)
+                // 디코더 정리
+                foreach (var decoder in _decoders.Values)
+                {
+                    decoder.Dispose();
+                }
+                _decoders.Clear();
+
+                // 마지막 프레임 정리
+                foreach (var frame in _lastFrames.Values)
+                {
+                    frame.Dispose();
+                }
+                _lastFrames.Clear();
+
+                // 기타 리소스 정리
+                _networkServer?.Stop();
+                _networkUpdateTimer?.Stop();
+            }
+            catch (Exception ex)
             {
-                frame.Dispose();
+                FileLogger.Instance.WriteError("리소스 정리 중 오류 발생", ex);
             }
-
-            _networkServer?.Dispose();
-
-            FileLogger.Instance.WriteInfo("호스트 메인 폼 종료");
         }
 
         private void OnStartButtonClick(object sender, EventArgs e)
@@ -228,16 +246,53 @@ namespace ScreenShare.Host.Forms
 
         private void OnScreenDataReceived(object sender, ScreenDataEventArgs e)
         {
-            if (_decoders.TryGetValue(e.ClientNumber, out var decoder))
+            try
             {
-                try
+                int clientNumber = e.ClientNumber;
+
+                // 해당 클라이언트용 디코더 가져오기
+                var decoder = _decoders.GetOrAdd(clientNumber, num => {
+                    var newDecoder = new FFmpegDecoder();
+                    FileLogger.Instance.WriteInfo($"클라이언트 {clientNumber}용 새 디코더 생성");
+                    return newDecoder;
+                });
+
+                // 데이터 디코딩
+                Bitmap decodedFrame = decoder.DecodeFrame(e.ScreenData, e.Width, e.Height);
+
+                if (decodedFrame != null)
                 {
-                    decoder.DecodeFrame(e.ScreenData, e.Width, e.Height);
+                    // 원격 제어 폼이 있으면 프레임 전달
+                    if (_remoteControlForms.TryGetValue(clientNumber, out var form))
+                    {
+                        form.UpdateImage(decodedFrame);
+                    }
+                    else
+                    {
+                        // 타일에 축소된 이미지 표시
+                        var clientTile = _clientTiles.FirstOrDefault(tile => tile.ClientNumber == clientNumber);
+                        if (clientTile != null)
+                        {
+                            // 타일 크기에 맞게 이미지 축소
+                            using (Bitmap resizedImage = new Bitmap(decodedFrame, clientTile.Width, clientTile.Height))
+                            {
+                                clientTile.UpdateImage(resizedImage);
+                            }
+                        }
+
+                        // 마지막 프레임 저장 (원격 제어 시작 시 사용)
+                        Bitmap oldFrame;
+                        if (_lastFrames.TryRemove(clientNumber, out oldFrame))
+                        {
+                            oldFrame.Dispose();
+                        }
+                        _lastFrames[clientNumber] = decodedFrame;
+                    }
                 }
-                catch (Exception ex)
-                {
-                    FileLogger.Instance.WriteError($"클라이언트 {e.ClientNumber} 디코딩 오류", ex);
-                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Instance.WriteError("화면 데이터 처리 오류", ex);
             }
         }
 
@@ -281,73 +336,51 @@ namespace ScreenShare.Host.Forms
         // 이전 OnTileClick 메서드를 OnTileDoubleClick으로 대체하고 개선
         private void OnTileDoubleClick(object sender, EventArgs e)
         {
-            if (sender is ClientTile tile && tile.Connected)
+            if (sender is ClientTile tile)
             {
-                FileLogger.Instance.WriteInfo($"타일 {tile.ClientNumber} 더블클릭 - 원격 제어 시작");
+                int clientNumber = tile.ClientNumber;
+                FileLogger.Instance.WriteInfo($"타일 {clientNumber} 더블클릭 - 원격 제어 시작");
 
-                // 이미 열려있는 창 확인
-                foreach (Form form in Application.OpenForms)
+                // 이미 열린 원격 제어 창이 있는지 확인
+                if (_remoteControlForms.ContainsKey(clientNumber))
                 {
-                    if (form is RemoteControlForm rcForm && rcForm.ClientNumber == tile.ClientNumber)
-                    {
-                        form.Activate();
-                        FileLogger.Instance.WriteInfo($"클라이언트 {tile.ClientNumber}의 원격 제어 창이 이미 존재함");
-                        return;
-                    }
+                    // 이미 열려 있으면 포커스 가져오기
+                    _remoteControlForms[clientNumber].Focus();
+                    return;
                 }
 
-                // 원격 제어 요청
-                if (_networkServer.SendRemoteControlRequest(tile.ClientNumber))
+                // 최근 프레임이 있는지 확인
+                Bitmap initialFrame = null;
+                if (_lastFrames.TryGetValue(clientNumber, out var frame))
                 {
-                    try
-                    {
-                        // 원격 제어 창 열기
+                    initialFrame = frame;
+                }
 
-                        Bitmap frameCopy = null;
-                        if (_lastFrames.TryGetValue(tile.ClientNumber, out var lastFrame))
-                        {
-                            try
-                            {
-                                frameCopy = (Bitmap)lastFrame.Clone();
-                            }
-                            catch (Exception ex)
-                            {
-                                FileLogger.Instance.WriteError("원격 제어 창 생성 시 lastFrame 복제 오류", ex);
-                                frameCopy = null;
-                            }
-                        }
+                // 원격 제어 요청 전송
+                if (_networkServer.SendRemoteControlRequest(clientNumber))
+                {
+                    // 원격 제어 폼 생성
+                    var remoteForm = new RemoteControlForm(_networkServer, clientNumber, initialFrame);
+                    _remoteControlForms.TryAdd(clientNumber, remoteForm);
 
+                    // 폼 종료 이벤트 처리
+                    remoteForm.FormClosed += (s, args) => {
+                        // 원격 제어 종료 메시지 전송
+                        _networkServer.SendRemoteControlEnd(clientNumber);
+                        RemoteControlForm removedForm;
+                        _remoteControlForms.TryRemove(clientNumber, out removedForm);
+                    };
 
-                        var remoteForm = new RemoteControlForm(
-                            _networkServer, tile.ClientNumber, frameCopy);
-
-                        remoteForm.FormClosed += (s, args) =>
-                        {
-                            // 원격 제어 종료 요청
-                            _networkServer.SendRemoteControlEnd(tile.ClientNumber);
-                            FileLogger.Instance.WriteInfo($"클라이언트 {tile.ClientNumber} 원격 제어 종료");
-                        };
-
-                        remoteForm.Show();
-                        FileLogger.Instance.WriteInfo($"클라이언트 {tile.ClientNumber} 원격 제어 창 열림");
-                    }
-                    catch (Exception ex)
-                    {
-                        FileLogger.Instance.WriteError($"원격 제어 창 생성 오류", ex);
-                        MessageBox.Show($"원격 제어 창을 열 수 없습니다: {ex.Message}", "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    }
+                    // 원격 제어 창 표시
+                    remoteForm.Show();
+                    remoteForm.Focus();
+                    FileLogger.Instance.WriteInfo($"클라이언트 {clientNumber} 원격 제어 창 열림");
                 }
                 else
                 {
-                    FileLogger.Instance.WriteWarning($"클라이언트 {tile.ClientNumber}에 원격 제어 요청 실패");
-                    MessageBox.Show($"클라이언트 {tile.ClientNumber}에 원격 제어 요청을 보낼 수 없습니다.", "경고", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    FileLogger.Instance.WriteError($"클라이언트 {clientNumber}에 원격 제어 요청 실패");
+                    MessageBox.Show($"클라이언트 {clientNumber}에 원격 제어 요청을 보낼 수 없습니다.", "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
-            }
-            else if (sender is ClientTile disconnectedTile)
-            {
-                // 연결되지 않은 타일을 클릭한 경우
-                FileLogger.Instance.WriteWarning($"타일 {disconnectedTile.ClientNumber} 클릭 - 연결되지 않음");
-                MessageBox.Show($"클라이언트 {disconnectedTile.ClientNumber}가 연결되어 있지 않습니다.", "알림", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
         }
 
