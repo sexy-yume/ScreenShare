@@ -14,8 +14,8 @@ namespace ScreenShare.Common.Settings
 
         // 화면 캡처 관련 설정
         public int LowResFps { get; set; } = 8;
-        public int HighResFps { get; set; } = 60;
-        public int LowResQuality { get; set; } = 70;
+        public int HighResFps { get; set; } = 30;
+        public int LowResQuality { get; set; } = 30;
         public int HighResQuality { get; set; } = 90;
 
         private static readonly string SettingsPath = Path.Combine(
