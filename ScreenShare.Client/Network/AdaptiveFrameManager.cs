@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
 using System.Threading;
+using System.Collections.Concurrent;
 using ScreenShare.Common.Utils;
 
 namespace ScreenShare.Client.Network
@@ -9,9 +10,9 @@ namespace ScreenShare.Client.Network
     /// Manages adaptive frame rate and bitrate control based on network conditions
     /// and host feedback to minimize latency and optimize quality.
     /// </summary>
-    public class AdaptiveFrameManager
+    public class AdaptiveFrameManager : IDisposable
     {
-        // Performance tracking
+        // 성능 추적
         private readonly Stopwatch _performanceTimer = new Stopwatch();
         private long _totalFramesSent = 0;
         private long _lastAckFrameId = 0;
@@ -19,23 +20,33 @@ namespace ScreenShare.Client.Network
         private long _totalLatency = 0;
         private readonly object _syncLock = new object();
 
-        // Network statistics
+        // GOP 추적 및 키프레임 관리
+        private readonly ConcurrentDictionary<long, DateTime> _sentFrames = new ConcurrentDictionary<long, DateTime>();
+        private long _lastKeyframeId = 0;
+        private DateTime _lastKeyframeSent = DateTime.MinValue;
+        private int _framesSinceKeyframe = 0;
+        private readonly ConcurrentDictionary<long, bool> _keyframeMap = new ConcurrentDictionary<long, bool>();
+
+        // 네트워크 통계
         private int _currentPing = 0;
         private int _packetLoss = 0;
+        private int _hostQueueLength = 0;
         private int _currentBitrate;
         private int _targetFps;
         private int _currentQuality;
         private bool _isRemoteControlActive = false;
 
-        // Rate adaptation settings
+        // 적응형 조정 설정
         private int _minBitrate = 500_000;      // 500 Kbps
         private int _maxBitrate = 20_000_000;   // 20 Mbps
         private int _minFps = 5;
         private int _maxFps = 60;
         private int _minQuality = 30;
         private int _maxQuality = 95;
+        private int _keyframeInterval = 10;      // 기본 10초마다 키프레임
+        private int _maxGopSize = 300;           // 최대 GOP 크기 (프레임 수)
 
-        // Flow control
+        // 흐름 제어
         private int _pendingFrames = 0;
         private int _maxPendingFrames = 2;
         private readonly System.Timers.Timer _adjustmentTimer;
@@ -43,10 +54,16 @@ namespace ScreenShare.Client.Network
         private DateTime _lastFrameSentTime = DateTime.MinValue;
         private TimeSpan _minFrameInterval = TimeSpan.Zero;
 
-        // Keyframe control
+        // 키프레임 제어
         private bool _forceKeyframe = false;
         private DateTime? _lastKeyframeRequest = null;
-        private TimeSpan _minKeyframeInterval = TimeSpan.FromSeconds(5); // 최소 5초 간격으로 키프레임 요청
+        private TimeSpan _minKeyframeInterval = TimeSpan.FromSeconds(2); // 최소 2초 간격으로 키프레임 요청
+        private int _keyframeRequestCounter = 0;  // 키프레임 요청 카운터
+        private int _consecutiveFrameDrops = 0;   // 연속 프레임 드롭 수
+
+        // 네트워크 상태 이력
+        private readonly CircularBuffer<NetworkCondition> _networkHistory = new CircularBuffer<NetworkCondition>(20);
+        private bool _recentNetworkDegradation = false;
 
         public event EventHandler<AdaptiveSettingsChangedEventArgs> SettingsChanged;
 
@@ -100,6 +117,16 @@ namespace ScreenShare.Client.Network
         }
 
         /// <summary>
+        /// 마지막으로 보낸 키프레임 ID
+        /// </summary>
+        public long LastKeyframeId => _lastKeyframeId;
+
+        /// <summary>
+        /// 마지막 키프레임 이후 프레임 수
+        /// </summary>
+        public int FramesSinceKeyframe => _framesSinceKeyframe;
+
+        /// <summary>
         /// Creates a new instance of the AdaptiveFrameManager
         /// </summary>
         /// <param name="initialFps">Initial frames per second</param>
@@ -112,58 +139,128 @@ namespace ScreenShare.Client.Network
             _currentBitrate = Math.Clamp(initialBitrate, _minBitrate, _maxBitrate);
             _minFrameInterval = TimeSpan.FromSeconds(1.0 / _targetFps);
 
-            // Setup periodic adjustment timer (adjust every 2 seconds)
-            _adjustmentTimer = new System.Timers.Timer(2000);
+            // Setup periodic adjustment timer (adjust every 1 second)
+            _adjustmentTimer = new System.Timers.Timer(1000);
             _adjustmentTimer.Elapsed += (s, e) => AdjustSettings();
             _adjustmentTimer.AutoReset = true;
             _adjustmentTimer.Start();
 
             _performanceTimer.Start();
-            EnhancedLogger.Instance.Info($"AdaptiveFrameManager initialized: FPS={_targetFps}, Quality={_currentQuality}, Bitrate={_currentBitrate/1000}kbps");
+            EnhancedLogger.Instance.Info(
+                $"AdaptiveFrameManager initialized: FPS={_targetFps}, " +
+                $"Quality={_currentQuality}, " +
+                $"Bitrate={_currentBitrate/1000}kbps");
+        }
+
+        /// <summary>
+        /// 프레임이 키프레임인지 등록
+        /// </summary>
+        public void RegisterKeyframe(long frameId)
+        {
+            lock (_syncLock)
+            {
+                _keyframeMap[frameId] = true;
+                _lastKeyframeId = frameId;
+                _lastKeyframeSent = DateTime.UtcNow;
+                _framesSinceKeyframe = 0;
+
+                EnhancedLogger.Instance.Info($"키프레임 등록: ID={frameId}");
+            }
         }
 
         /// <summary>
         /// Called when a new frame is about to be sent. Returns true if the frame should be sent,
         /// or false if it should be skipped based on adaptive rate control.
         /// </summary>
-        public bool BeginFrameSend()
+        /// <param name="isKeyFrame">프레임이 키프레임인지 여부</param>
+        /// <returns>프레임을 전송해야 하면 true, 그렇지 않으면 false</returns>
+        public bool BeginFrameSend(bool isKeyFrame = false)
         {
             lock (_syncLock)
             {
-                // Initially allow frames to flow without restriction (first 10 frames)
+                // 처음 10개 프레임은 제한 없이 허용
                 if (_totalFramesSent < 10)
                 {
                     _lastFrameSentTime = DateTime.Now;
                     _lastFrameId++;
                     _pendingFrames++;
+                    _sentFrames[_lastFrameId] = DateTime.UtcNow;
+
+                    if (isKeyFrame)
+                    {
+                        RegisterKeyframe(_lastFrameId);
+                    }
+                    else
+                    {
+                        _framesSinceKeyframe++;
+                    }
+
                     return true;
                 }
 
-                // After initial frames, apply normal flow control
-                if (_frameThrottling && _pendingFrames >= _maxPendingFrames)
-                {
-                    // Skip frame if we have too many pending frames
-                    EnhancedLogger.Instance.Debug($"Throttling frame: pending={_pendingFrames}, max={_maxPendingFrames}");
-                    return false;
-                }
-
-                // Enforce frame rate limit
+                // 프레임 간격 제한 적용
                 TimeSpan timeSinceLastFrame = DateTime.Now - _lastFrameSentTime;
                 if (timeSinceLastFrame < _minFrameInterval)
                 {
-                    // Too soon for next frame
+                    // 다음 프레임을 보내기에 너무 이른 시간
                     return false;
                 }
 
-                // Track metrics
+                // 주기적 키프레임 또는 최대 GOP 크기에 도달하면 강제 키프레임
+                if (!isKeyFrame &&
+                    (DateTime.UtcNow - _lastKeyframeSent).TotalSeconds > _keyframeInterval ||
+                    _framesSinceKeyframe >= _maxGopSize)
+                {
+                    _forceKeyframe = true;
+                    EnhancedLogger.Instance.Info(
+                        $"주기적 키프레임 요청: 마지막 키프레임으로부터 " +
+                        $"{(DateTime.UtcNow - _lastKeyframeSent).TotalSeconds:F1}초, " +
+                        $"프레임 수={_framesSinceKeyframe}");
+                    return false;
+                }
+
+                // 흐름 제어 적용 (키프레임은 항상 허용)
+                if (!isKeyFrame && _frameThrottling && _pendingFrames >= _maxPendingFrames)
+                {
+                    // 대기 중인 프레임이 너무 많으면 이 프레임 건너뛰기
+                    _consecutiveFrameDrops++;
+                    EnhancedLogger.Instance.Debug(
+                        $"프레임 제한: 대기={_pendingFrames}, 최대={_maxPendingFrames}, " +
+                        $"연속 드롭={_consecutiveFrameDrops}");
+
+                    // 연속으로 너무 많은 프레임을 건너뛰면 키프레임 강제 요청
+                    if (_consecutiveFrameDrops >= 10)
+                    {
+                        _forceKeyframe = true;
+                        _consecutiveFrameDrops = 0;
+                        EnhancedLogger.Instance.Warning("연속 프레임 드롭으로 인한 키프레임 요청");
+                    }
+
+                    return false;
+                }
+
+                // 메트릭 추적
                 _lastFrameSentTime = DateTime.Now;
                 _lastFrameId++;
                 _pendingFrames++;
+                _sentFrames[_lastFrameId] = DateTime.UtcNow;
+                _consecutiveFrameDrops = 0;
 
-                // Log periodically
+                if (isKeyFrame)
+                {
+                    RegisterKeyframe(_lastFrameId);
+                }
+                else
+                {
+                    _framesSinceKeyframe++;
+                }
+
+                // 주기적 로그
                 if (_lastFrameId % 30 == 0)
                 {
-                    EnhancedLogger.Instance.Debug($"Frame flow: id={_lastFrameId}, pending={_pendingFrames}, ack={_lastAckFrameId}, fps={_targetFps}");
+                    EnhancedLogger.Instance.Debug(
+                        $"프레임 흐름: id={_lastFrameId}, 대기={_pendingFrames}, " +
+                        $"응답={_lastAckFrameId}, fps={_targetFps}, 키프레임이후={_framesSinceKeyframe}");
                 }
 
                 return true;
@@ -175,29 +272,69 @@ namespace ScreenShare.Client.Network
         /// </summary>
         /// <param name="frameId">The ID of the acknowledged frame</param>
         /// <param name="roundTripTime">The measured round-trip time in milliseconds</param>
-        public void FrameAcknowledged(long frameId, int roundTripTime)
+        /// <param name="hostQueueLength">The host's queue length for this client</param>
+        /// <param name="processingTime">The host's processing time for this frame in microseconds</param>
+        public void FrameAcknowledged(long frameId, int roundTripTime, int hostQueueLength, long processingTime)
         {
             lock (_syncLock)
             {
-                EnhancedLogger.Instance.Debug($"Frame ack received: id={frameId}, rtt={roundTripTime}ms, pending={_pendingFrames}");
+                EnhancedLogger.Instance.Debug(
+                    $"프레임 응답 수신: id={frameId}, rtt={roundTripTime}ms, " +
+                    $"호스트큐={hostQueueLength}, 처리시간={processingTime/1000.0}ms, 대기={_pendingFrames}");
 
+                // 마지막 응답 ID 업데이트
                 if (frameId > _lastAckFrameId)
                 {
                     _lastAckFrameId = frameId;
                 }
 
+                // 대기 프레임 수 조정
                 _pendingFrames = Math.Max(0, _pendingFrames - 1);
+
+                // 네트워크 메트릭 저장
                 _currentPing = roundTripTime;
                 _totalLatency += roundTripTime;
                 _totalFramesSent++;
+                _hostQueueLength = hostQueueLength;
 
-                // Log statistics periodically
+                // 현재 네트워크 상태 업데이트
+                _networkHistory.Add(new NetworkCondition
+                {
+                    Timestamp = DateTime.UtcNow,
+                    Rtt = roundTripTime,
+                    HostQueueLength = hostQueueLength,
+                    PacketLoss = _packetLoss
+                });
+
+                // 전송 시간 추적 및 제거
+                if (_sentFrames.TryRemove(frameId, out DateTime sentTime))
+                {
+                    TimeSpan latency = DateTime.UtcNow - sentTime;
+
+                    // 총 지연 시간이 너무 길면 네트워크 상태가 좋지 않은 것으로 간주
+                    if (latency.TotalMilliseconds > 500)
+                    {
+                        EnhancedLogger.Instance.Warning(
+                            $"높은 프레임 지연: id={frameId}, " +
+                            $"지연={latency.TotalMilliseconds:F1}ms, rtt={roundTripTime}ms");
+
+                        // 네트워크 상태 악화 감지
+                        _recentNetworkDegradation = true;
+
+                        // 즉시 설정 조정
+                        AdjustSettings(true);
+                    }
+                }
+
+                // 주기적 통계 기록
                 if (_totalFramesSent % 30 == 0)
                 {
                     EnhancedLogger.Instance.Info(
-                        $"Frame statistics: Sent={_totalFramesSent}, Avg Latency={AverageLatency.TotalMilliseconds:F1}ms, " +
-                        $"Current RTT={_currentPing}ms, Pending={_pendingFrames}, " +
-                        $"FPS={_targetFps}, Quality={_currentQuality}, Bitrate={_currentBitrate/1000}kbps");
+                        $"프레임 통계: 전송={_totalFramesSent}, " +
+                        $"평균 지연={AverageLatency.TotalMilliseconds:F1}ms, " +
+                        $"현재 RTT={_currentPing}ms, 대기={_pendingFrames}, " +
+                        $"FPS={_targetFps}, 품질={_currentQuality}, " +
+                        $"비트레이트={_currentBitrate/1000}kbps");
                 }
             }
         }
@@ -209,7 +346,15 @@ namespace ScreenShare.Client.Network
         {
             lock (_syncLock)
             {
+                int oldLoss = _packetLoss;
                 _packetLoss = percentLoss;
+
+                // 패킷 손실이 급격히 증가하면 패킷 손실 기반 품질 조정 트리거
+                if (percentLoss > oldLoss + 10)
+                {
+                    EnhancedLogger.Instance.Warning($"패킷 손실 증가: {oldLoss}% -> {percentLoss}%");
+                    AdjustSettings(true);
+                }
             }
         }
 
@@ -224,23 +369,66 @@ namespace ScreenShare.Client.Network
                 {
                     _isRemoteControlActive = active;
 
-                    // Quick adaptation for remote control mode changes
+                    // 원격 제어 모드 변경 시 빠른 적응
                     if (active)
                     {
-                        // Favor responsiveness for remote control
+                        // 원격 제어는 응답성 우선
                         TargetFps = Math.Min(_maxFps, _targetFps + 10);
-                        _maxPendingFrames = 1; // Tighter flow control for lower latency
+                        _maxPendingFrames = 1; // 낮은 지연시간을 위한 더 엄격한 흐름 제어
                         _frameThrottling = true;
+                        _keyframeInterval = 5; // 더 빈번한 키프레임 (5초마다)
                     }
                     else
                     {
-                        // Return to more relaxed settings for viewing only
+                        // 뷰잉 모드는 더 여유로운 설정
                         _maxPendingFrames = 2;
                         TargetFps = Math.Max(_minFps, _targetFps - 5);
+                        _keyframeInterval = 10; // 일반 키프레임 간격 (10초마다)
                     }
 
-                    AdjustSettings(true); // Force immediate adjustment
+                    // 강제 키프레임 요청
+                    _forceKeyframe = true;
+
+                    // 즉시 설정 조정
+                    AdjustSettings(true);
                 }
+            }
+        }
+
+        /// <summary>
+        /// 호스트로부터 키프레임 요청을 처리합니다.
+        /// </summary>
+        public void HandleKeyframeRequest()
+        {
+            lock (_syncLock)
+            {
+                // 키프레임 요청 카운터 증가
+                _keyframeRequestCounter++;
+
+                // 빠른 요청 다수 = 심각한 네트워크 문제
+                if (_keyframeRequestCounter >= 3 &&
+                    (DateTime.UtcNow - _lastKeyframeRequest.GetValueOrDefault(DateTime.MinValue)).TotalSeconds < 10)
+                {
+                    EnhancedLogger.Instance.Warning(
+                        $"빈번한 키프레임 요청: {_keyframeRequestCounter}회 - 품질 대폭 감소");
+
+                    // 품질과 비트레이트 대폭 감소
+                    _currentQuality = Math.Max(_minQuality, _currentQuality / 2);
+                    _currentBitrate = Math.Max(_minBitrate, _currentBitrate / 2);
+
+                    // 키프레임 카운터 리셋
+                    _keyframeRequestCounter = 0;
+
+                    // 설정 변경 알림
+                    OnSettingsChanged();
+                }
+
+                // 키프레임 강제 설정
+                _forceKeyframe = true;
+                _lastKeyframeRequest = DateTime.UtcNow;
+
+                EnhancedLogger.Instance.Info(
+                    $"호스트로부터 키프레임 요청 처리 (요청 #{_keyframeRequestCounter})");
             }
         }
 
@@ -251,85 +439,140 @@ namespace ScreenShare.Client.Network
         {
             lock (_syncLock)
             {
+                // 즉시 조정이 아니고 최근에 큰 네트워크 변화가 없으면 1초에 한 번만 조정
+                if (!immediate && !_recentNetworkDegradation)
+                    return;
+
                 bool changed = false;
                 int newFps = _targetFps;
                 int newQuality = _currentQuality;
                 int newBitrate = _currentBitrate;
 
                 // 네트워크 상태 분석 향상
-                bool criticalNetwork = _currentPing > 200 || _packetLoss > 15 || _pendingFrames > _maxPendingFrames * 2;
-                bool poorNetwork = _currentPing > 100 || _packetLoss > 5 || _pendingFrames > _maxPendingFrames;
-                bool goodNetwork = _currentPing < 50 && _packetLoss < 2 && _pendingFrames == 0;
+                bool criticalNetwork = AnalyzeNetworkCondition(out NetworkSeverity severity);
+
+                // 네트워크 상태 로깅
+                if (criticalNetwork || immediate || _recentNetworkDegradation)
+                {
+                    EnhancedLogger.Instance.Info(
+                        $"네트워크 상태: 심각도={severity}, " +
+                        $"RTT={_currentPing}ms, 패킷 손실={_packetLoss}%, " +
+                        $"호스트 큐={_hostQueueLength}, 대기={_pendingFrames}");
+                }
 
                 // 네트워크 상태에 따른 설정 조정
-                if (criticalNetwork)
+                switch (severity)
                 {
-                    // 심각한 네트워크 상태일 때 더 적극적으로 품질 저하
-                    EnhancedLogger.Instance.Warning("심각한 네트워크 상태 감지 - 품질 대폭 저하");
+                    case NetworkSeverity.Critical:
+                        // 심각한 네트워크 상태일 때 더 적극적으로 품질 저하
+                        EnhancedLogger.Instance.Warning("심각한 네트워크 상태 감지 - 품질 대폭 저하");
 
-                    // 키프레임 강제 요청
-                    _forceKeyframe = true;
+                        // 키프레임 강제 요청
+                        _forceKeyframe = true;
 
-                    if (_isRemoteControlActive)
-                    {
-                        // 원격 제어 모드에서는 최소 프레임율 유지하면서 품질/비트레이트 대폭 감소
-                        newFps = Math.Max(_minFps + 5, _targetFps / 2);  // FPS 절반으로 줄이되 최소 상호작용 속도 유지
-                        newQuality = Math.Max(_minQuality, _currentQuality / 2);  // 품질 절반으로
-                        newBitrate = Math.Max(_minBitrate, _currentBitrate / 3);  // 비트레이트 66% 감소
-                    }
-                    else
-                    {
-                        // 뷰잉 모드에서는 모든 설정 대폭 감소
-                        newFps = Math.Max(_minFps, _targetFps / 2);
-                        newQuality = Math.Max(_minQuality, _currentQuality / 2);
-                        newBitrate = Math.Max(_minBitrate, _currentBitrate / 3);
-                    }
+                        if (_isRemoteControlActive)
+                        {
+                            // 원격 제어 모드에서는 최소 프레임율 유지하면서 품질/비트레이트 대폭 감소
+                            newFps = Math.Max(_minFps + 5, _targetFps / 2);  // FPS 절반으로 줄이되 최소 상호작용 속도 유지
+                            newQuality = Math.Max(_minQuality, _currentQuality / 2);  // 품질 절반으로
+                            newBitrate = Math.Max(_minBitrate, _currentBitrate / 3);  // 비트레이트 66% 감소
+                        }
+                        else
+                        {
+                            // 뷰잉 모드에서는 모든 설정 대폭 감소
+                            newFps = Math.Max(_minFps, _targetFps / 2);
+                            newQuality = Math.Max(_minQuality, _currentQuality / 2);
+                            newBitrate = Math.Max(_minBitrate, _currentBitrate / 3);
+                        }
 
-                    // 흐름 제어 강화
-                    _frameThrottling = true;
-                    _maxPendingFrames = 1;
-                }
-                else if (poorNetwork)
-                {
-                    // 좋지 않은 네트워크에서 더 적극적인 품질 조정
-                    if (_isRemoteControlActive)
-                    {
-                        // 원격 제어 모드에서는 FPS 유지하면서 품질/비트레이트 적극 감소
-                        newQuality = Math.Max(_minQuality, _currentQuality - 10);
-                        newBitrate = Math.Max(_minBitrate, (int)(_currentBitrate * 0.7));
-                    }
-                    else
-                    {
-                        // 뷰잉 모드에서는 FPS와 품질 모두 적극 감소
-                        newFps = Math.Max(_minFps, _targetFps - 5);
-                        newQuality = Math.Max(_minQuality, _currentQuality - 8);
-                        newBitrate = Math.Max(_minBitrate, (int)(_currentBitrate * 0.7));
-                    }
+                        // 강화된 흐름 제어
+                        _frameThrottling = true;
+                        _maxPendingFrames = 1;
+                        break;
 
-                    // 흐름 제어 강화
-                    _frameThrottling = true;
-                    _maxPendingFrames = Math.Max(1, _maxPendingFrames - 1);
-                }
-                else if (goodNetwork && (_isRemoteControlActive || immediate))
-                {
-                    // 좋은 네트워크에서 점진적 품질 향상
-                    if (_isRemoteControlActive)
-                    {
-                        // 원격 제어 모드에서는 높은 FPS 선호
-                        newFps = Math.Min(_maxFps, _targetFps + 2);
-                        newQuality = Math.Min(_maxQuality, _currentQuality + 1);
-                        newBitrate = Math.Min(_maxBitrate, (int)(_currentBitrate * 1.1));
-                    }
-                    else
-                    {
-                        // 뷰잉 모드에서는 높은 품질 선호
-                        newFps = Math.Min(_maxFps, _targetFps + 1);
-                        newQuality = Math.Min(_maxQuality, _currentQuality + 3);
-                        newBitrate = Math.Min(_maxBitrate, (int)(_currentBitrate * 1.05));
-                    }
+                    case NetworkSeverity.Bad:
+                        // 좋지 않은 네트워크에서 더 적극적인 품질 조정
+                        if (_isRemoteControlActive)
+                        {
+                            // 원격 제어 모드에서는 FPS 유지하면서 품질/비트레이트 적극 감소
+                            newQuality = Math.Max(_minQuality, _currentQuality - 10);
+                            newBitrate = Math.Max(_minBitrate, (int)(_currentBitrate * 0.7));
+                        }
+                        else
+                        {
+                            // 뷰잉 모드에서는 FPS와 품질 모두 적극 감소
+                            newFps = Math.Max(_minFps, _targetFps - 5);
+                            newQuality = Math.Max(_minQuality, _currentQuality - 8);
+                            newBitrate = Math.Max(_minBitrate, (int)(_currentBitrate * 0.7));
+                        }
 
-                    // 흐름 제어 완화
-                    _maxPendingFrames = Math.Min(3, _maxPendingFrames + 1);
+                        // 흐름 제어 강화
+                        _frameThrottling = true;
+                        _maxPendingFrames = Math.Max(1, _maxPendingFrames - 1);
+                        break;
+
+                    case NetworkSeverity.Moderate:
+                        // 보통 네트워크에서는 약간의 조정
+                        if (_isRemoteControlActive)
+                        {
+                            // 원격 제어 모드에서는 약간 품질 조정
+                            newQuality = Math.Max(_minQuality, _currentQuality - 5);
+                            newBitrate = Math.Max(_minBitrate, (int)(_currentBitrate * 0.85));
+                        }
+                        else
+                        {
+                            // 뷰잉 모드에서는 FPS 중심 조정
+                            newFps = Math.Max(_minFps, _targetFps - 2);
+                            newQuality = Math.Max(_minQuality, _currentQuality - 3);
+                            newBitrate = Math.Max(_minBitrate, (int)(_currentBitrate * 0.9));
+                        }
+
+                        // 기본 흐름 제어
+                        _frameThrottling = true;
+                        break;
+
+                    case NetworkSeverity.Good:
+                        // 좋은 네트워크에서 점진적 품질 향상
+                        if (_isRemoteControlActive)
+                        {
+                            // 원격 제어 모드에서는 높은 FPS 선호
+                            newFps = Math.Min(_maxFps, _targetFps + 2);
+                            newQuality = Math.Min(_maxQuality, _currentQuality + 1);
+                            newBitrate = Math.Min(_maxBitrate, (int)(_currentBitrate * 1.05));
+                        }
+                        else
+                        {
+                            // 뷰잉 모드에서는 높은 품질 선호
+                            newFps = Math.Min(_maxFps, _targetFps + 1);
+                            newQuality = Math.Min(_maxQuality, _currentQuality + 3);
+                            newBitrate = Math.Min(_maxBitrate, (int)(_currentBitrate * 1.05));
+                        }
+
+                        // 흐름 제어 완화
+                        _maxPendingFrames = Math.Min(3, _maxPendingFrames + 1);
+                        break;
+
+                    case NetworkSeverity.Excellent:
+                        // 최고 네트워크 상태에서 빠른 품질 향상
+                        if (_isRemoteControlActive)
+                        {
+                            // 원격 제어 모드에서는 최대 FPS 및 품질 향상
+                            newFps = Math.Min(_maxFps, _targetFps + 5);
+                            newQuality = Math.Min(_maxQuality, _currentQuality + 5);
+                            newBitrate = Math.Min(_maxBitrate, (int)(_currentBitrate * 1.1));
+                        }
+                        else
+                        {
+                            // 뷰잉 모드에서는 최대 품질 향상
+                            newFps = Math.Min(_maxFps, _targetFps + 2);
+                            newQuality = Math.Min(_maxQuality, _currentQuality + 8);
+                            newBitrate = Math.Min(_maxBitrate, (int)(_currentBitrate * 1.1));
+                        }
+
+                        // 흐름 제어 대폭 완화
+                        _frameThrottling = false;
+                        _maxPendingFrames = 3;
+                        break;
                 }
 
                 // 필요시 변경사항 적용
@@ -354,9 +597,95 @@ namespace ScreenShare.Client.Network
                 // 설정 변경사항 통지
                 if (changed)
                 {
-                    EnhancedLogger.Instance.Info($"적응형 설정 조정: FPS={_targetFps}, 품질={_currentQuality}, 비트레이트={_currentBitrate/1000}kbps");
+                    EnhancedLogger.Instance.Info(
+                        $"적응형 설정 조정: FPS={_targetFps}, 품질={_currentQuality}, " +
+                        $"비트레이트={_currentBitrate/1000}kbps, 네트워크 심각도={severity}");
                     OnSettingsChanged();
                 }
+
+                // 네트워크 상태 플래그 초기화
+                _recentNetworkDegradation = false;
+            }
+        }
+
+        /// <summary>
+        /// 네트워크 상태 분석
+        /// </summary>
+        private bool AnalyzeNetworkCondition(out NetworkSeverity severity)
+        {
+            // 최근 몇 개의 샘플에서 평균 계산
+            int recentCount = Math.Min(5, _networkHistory.Count);
+            if (recentCount == 0)
+            {
+                severity = NetworkSeverity.Good; // 기본값
+                return false;
+            }
+
+            int totalRtt = 0;
+            int totalPacketLoss = 0;
+            int totalQueueLength = 0;
+            int highRttCount = 0;
+            int highPacketLossCount = 0;
+
+            for (int i = 0; i < recentCount; i++)
+            {
+                var condition = _networkHistory[i];
+                totalRtt += condition.Rtt;
+                totalPacketLoss += condition.PacketLoss;
+                totalQueueLength += condition.HostQueueLength;
+
+                if (condition.Rtt > 150) highRttCount++;
+                if (condition.PacketLoss > 5) highPacketLossCount++;
+            }
+
+            // 평균값 계산
+            int avgRtt = totalRtt / recentCount;
+            int avgPacketLoss = totalPacketLoss / recentCount;
+            int avgQueueLength = totalQueueLength / recentCount;
+
+            // 현재 설정 고려 (높은 비트레이트는 더 민감하게 대응)
+            bool highBitrate = _currentBitrate > 8_000_000; // 8 Mbps 이상이면 고비트레이트
+            bool highFps = _targetFps > 30; // 30 FPS 이상이면 고프레임레이트
+
+            // 심각도 결정
+            if ((avgRtt > 200 && avgPacketLoss > 10) ||
+                avgPacketLoss > 15 ||
+                avgRtt > 300 ||
+                (highBitrate && avgPacketLoss > 8) ||
+                _pendingFrames > _maxPendingFrames * 2 ||
+                avgQueueLength > 3)
+            {
+                severity = NetworkSeverity.Critical;
+                return true;
+            }
+            else if ((avgRtt > 150 && avgPacketLoss > 5) ||
+                     avgPacketLoss > 8 ||
+                     avgRtt > 200 ||
+                     (highBitrate && avgPacketLoss > 5) ||
+                     _pendingFrames > _maxPendingFrames ||
+                     avgQueueLength > 2)
+            {
+                severity = NetworkSeverity.Bad;
+                return true;
+            }
+            else if ((avgRtt > 100 && avgPacketLoss > 2) ||
+                     avgPacketLoss > 5 ||
+                     avgRtt > 150 ||
+                     _pendingFrames > 0 ||
+                     avgQueueLength > 1)
+            {
+                severity = NetworkSeverity.Moderate;
+                return false;
+            }
+            else if (avgRtt < 50 && avgPacketLoss < 1 && _pendingFrames == 0 && avgQueueLength == 0)
+            {
+                severity = NetworkSeverity.Excellent;
+                return false;
+            }
+            else
+            {
+                severity = NetworkSeverity.Good;
+                return false;
             }
         }
 
@@ -369,7 +698,9 @@ namespace ScreenShare.Client.Network
                 Bitrate = _currentBitrate
             };
 
-            EnhancedLogger.Instance.Info($"Adaptive settings changed: FPS={_targetFps}, Quality={_currentQuality}, Bitrate={_currentBitrate/1000}kbps");
+            EnhancedLogger.Instance.Info(
+                $"적응형 설정 변경: FPS={_targetFps}, 품질={_currentQuality}, " +
+                $"비트레이트={_currentBitrate/1000}kbps");
             SettingsChanged?.Invoke(this, args);
         }
 
@@ -379,6 +710,77 @@ namespace ScreenShare.Client.Network
             _adjustmentTimer?.Dispose();
             _performanceTimer.Stop();
         }
+    }
+
+    /// <summary>
+    /// 네트워크 상태 심각도
+    /// </summary>
+    public enum NetworkSeverity
+    {
+        Excellent,  // 최상
+        Good,       // 좋음
+        Moderate,   // 보통
+        Bad,        // 나쁨
+        Critical    // 심각
+    }
+
+    /// <summary>
+    /// 네트워크 상태 정보
+    /// </summary>
+    public class NetworkCondition
+    {
+        public DateTime Timestamp { get; set; }
+        public int Rtt { get; set; }
+        public int PacketLoss { get; set; }
+        public int HostQueueLength { get; set; }
+    }
+
+    /// <summary>
+    /// 원형 버퍼 구현
+    /// </summary>
+    public class CircularBuffer<T>
+    {
+        private readonly T[] _buffer;
+        private int _start;
+        private int _end;
+        private int _count;
+
+        public CircularBuffer(int capacity)
+        {
+            _buffer = new T[capacity];
+            _start = 0;
+            _end = 0;
+            _count = 0;
+        }
+
+        public void Add(T item)
+        {
+            if (_count == _buffer.Length)
+            {
+                _buffer[_end] = item;
+                _end = (_end + 1) % _buffer.Length;
+                _start = (_start + 1) % _buffer.Length;
+            }
+            else
+            {
+                _buffer[_end] = item;
+                _end = (_end + 1) % _buffer.Length;
+                _count++;
+            }
+        }
+
+        public T this[int index]
+        {
+            get
+            {
+                if (index < 0 || index >= _count)
+                    throw new IndexOutOfRangeException();
+
+                return _buffer[(_start + index) % _buffer.Length];
+            }
+        }
+
+        public int Count => _count;
     }
 
     public class AdaptiveSettingsChangedEventArgs : EventArgs
