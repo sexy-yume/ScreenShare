@@ -34,9 +34,9 @@ namespace ScreenShare.Host.Processing
         // Configuration settings
         private bool _dropOutdatedFrames = true;
         private TimeSpan _frameExpirationTime = TimeSpan.FromSeconds(1);
-        private int _maxQueueSizePerClient = 5;
+        private int _maxQueueSizePerClient = 10;
         private bool _useParallelProcessing = true;
-        private int _maxGopsPerClient = 3; // 클라이언트당 유지할 최대 GOP 수
+        private int _maxGopsPerClient = 10; // 클라이언트당 유지할 최대 GOP 수
 
         // Performance metrics
         private readonly Stopwatch _uptimeTimer = new Stopwatch();
@@ -87,10 +87,10 @@ namespace ScreenShare.Host.Processing
         /// </summary>
         public void Configure(
             bool dropOutdatedFrames = true,
-            int maxQueueSize = 5,
+            int maxQueueSize = 10,
             int frameExpirationMs = 1000,
             bool useParallelProcessing = true,
-            int maxGopsPerClient = 3)
+            int maxGopsPerClient = 10)
         {
             _dropOutdatedFrames = dropOutdatedFrames;
             _maxQueueSizePerClient = maxQueueSize;

@@ -185,7 +185,7 @@ namespace ScreenShare.Host.Forms
                     _processingManager = new FrameProcessingManager(_networkServer, _decoder);
                     _processingManager.Configure(
                         dropOutdatedFrames: true,
-                        maxQueueSize: 4,
+                        maxQueueSize: 10,
                         frameExpirationMs: 1000,
                         useParallelProcessing: true
                     );

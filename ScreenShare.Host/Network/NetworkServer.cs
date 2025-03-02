@@ -25,7 +25,7 @@ namespace ScreenShare.Host.Network
         // 큐 모니터링
         private ConcurrentDictionary<int, ConcurrentQueue<FrameProcessingTask>> _processingQueues =
             new ConcurrentDictionary<int, ConcurrentQueue<FrameProcessingTask>>();
-        private int _maxQueueSize = 3;
+        private int _maxQueueSize = 10;
 
         // 키프레임 요청 관련
         private ConcurrentDictionary<int, DateTime> _lastKeyframeRequestTime = new ConcurrentDictionary<int, DateTime>();
