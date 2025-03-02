@@ -115,7 +115,18 @@ namespace ScreenShare.Host.Rendering
             // Set viewport
             _context.Rasterizer.SetViewport(0, 0, _control.ClientSize.Width, _control.ClientSize.Height);
         }
-
+        public void ClearFrame()
+        {
+            // This method allows clearing the current frame reference
+            // to prevent accessing a disposed bitmap
+            lock (_renderLock)
+            {
+                // Clear the background to black
+                _context.ClearRenderTargetView(_renderTargetView, new Color4(0, 0, 0, 1));
+                _context.OutputMerger.SetRenderTargets(_renderTargetView);
+                _swapChain.Present(0, PresentFlags.None);
+            }
+        }
         private void CreateShaders()
         {
             // Simple vertex shader code

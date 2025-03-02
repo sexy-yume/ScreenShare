@@ -1,5 +1,4 @@
-﻿// ScreenShare.Common/Models/ScreenPacket.cs
-using System;
+﻿using System;
 using System.Text.Json.Serialization;
 
 namespace ScreenShare.Common.Models
@@ -25,7 +24,10 @@ namespace ScreenShare.Common.Models
         [JsonInclude]
         public long Timestamp { get; set; }
 
-        // 원격 제어용 필드
+        [JsonInclude]
+        public long FrameId { get; set; }
+
+        // Remote control fields
         [JsonInclude]
         public int? MouseX { get; set; }
 

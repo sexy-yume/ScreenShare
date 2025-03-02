@@ -1,5 +1,4 @@
-﻿// ScreenShare.Client/Forms/MainForm.cs
-using System;
+﻿using System;
 using System.Drawing;
 using System.Windows.Forms;
 using System.Diagnostics;
@@ -19,7 +18,19 @@ namespace ScreenShare.Client.Forms
         private FFmpegEncoder _encoder;
         private NetworkClient _networkClient;
         private System.Windows.Forms.Timer _networkUpdateTimer;
+        private System.Windows.Forms.Timer _statusUpdateTimer;
         private readonly object _syncLock = new object();
+
+        // Performance tracking
+        private PerformanceMetrics _currentMetrics = new PerformanceMetrics();
+        private bool _isPerformanceInfoVisible = false;
+
+        // UI components for status display
+        private StatusStrip _statusStrip;
+        private ToolStripStatusLabel _statusLabel;
+        private ToolStripStatusLabel _fpsLabel;
+        private ToolStripStatusLabel _bitrateLabel;
+        private ToolStripStatusLabel _pingLabel;
 
         public MainForm()
         {
@@ -27,61 +38,168 @@ namespace ScreenShare.Client.Forms
 
             try
             {
-                // 설정 로드
+                // Initialize EnhancedLogger instead of FileLogger
+                EnhancedLogger.Instance.SetLogLevels(
+                    EnhancedLogger.LogLevel.Info,  // Console level
+                    EnhancedLogger.LogLevel.Debug  // File level
+                );
+
+                // Load settings
                 _settings = ClientSettings.Load();
 
-                lblStatus.Text = "상태: 초기화 중...";
-                FileLogger.Instance.WriteInfo("메인 폼 초기화 시작");
+                lblStatus.Text = "Status: Initializing...";
+                EnhancedLogger.Instance.Info("Main form initialization starting");
 
-                // 화면 크기 가져오기
+                // Initialize components with enhanced status UI
+                InitializeStatusUI();
+
+                // Get screen size
                 var screenSize = Screen.PrimaryScreen.Bounds;
 
-                // 네트워크 클라이언트 초기화
+                // Initialize network client
                 _networkClient = new NetworkClient(_settings);
                 _networkClient.RemoteControlStatusChanged += OnRemoteControlStatusChanged;
                 _networkClient.RemoteControlReceived += OnRemoteControlReceived;
                 _networkClient.ConnectionStatusChanged += OnConnectionStatusChanged;
+                _networkClient.PerformanceUpdated += OnPerformanceUpdated;
 
-                // 인코더 초기화
+                // Initialize encoder
                 _encoder = new FFmpegEncoder(screenSize.Width, screenSize.Height, _settings.LowResQuality);
                 _encoder.FrameEncoded += OnFrameEncoded;
 
-                // 화면 캡처 초기화 - OptimizedScreenCapture 사용
+                // Initialize screen capture
                 _screenCapture = new OptimizedScreenCapture();
                 _screenCapture.Fps = _settings.LowResFps;
                 _screenCapture.Quality = _settings.LowResQuality;
                 _screenCapture.FrameCaptured += OnFrameCaptured;
 
-                // 타이머 초기화 - 네트워크 업데이트용
+                // Network update timer
                 _networkUpdateTimer = new System.Windows.Forms.Timer();
                 _networkUpdateTimer.Interval = 15;
                 _networkUpdateTimer.Tick += (s, e) => _networkClient.Update();
                 _networkUpdateTimer.Start();
 
-                // 시작
-                lblStatus.Text = "상태: 서버에 연결 중...";
+                // Status update timer
+                _statusUpdateTimer = new System.Windows.Forms.Timer();
+                _statusUpdateTimer.Interval = 1000; // Update status every second
+                _statusUpdateTimer.Tick += OnStatusUpdateTick;
+                _statusUpdateTimer.Start();
+
+                // Start services
+                lblStatus.Text = "Status: Connecting to server...";
                 _networkClient.Start();
                 _screenCapture.Start();
 
                 FormClosing += (s, e) => Cleanup();
 
-                FileLogger.Instance.WriteInfo("메인 폼 초기화 완료");
+                // Register keyboard shortcuts
+                KeyPreview = true;
+                KeyDown += OnKeyDown;
+
+                EnhancedLogger.Instance.Info("Main form initialization complete");
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("메인 폼 초기화 오류", ex);
-                MessageBox.Show($"초기화 오류: {ex.Message}", "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                EnhancedLogger.Instance.Error("Main form initialization error", ex);
+                MessageBox.Show($"Initialization error: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 Close();
             }
+        }
+
+        private void InitializeStatusUI()
+        {
+            // Set up status strip
+            _statusStrip = new StatusStrip();
+            _statusStrip.SizingGrip = false;
+
+            // Create status labels
+            _statusLabel = new ToolStripStatusLabel("Initializing...");
+            _statusLabel.AutoSize = true;
+            _statusLabel.Spring = true;
+            _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
+
+            _fpsLabel = new ToolStripStatusLabel("FPS: --");
+            _fpsLabel.AutoSize = true;
+            _fpsLabel.BorderSides = ToolStripStatusLabelBorderSides.Left;
+            _fpsLabel.BorderStyle = Border3DStyle.Etched;
+            _fpsLabel.Padding = new Padding(5, 0, 5, 0);
+
+            _bitrateLabel = new ToolStripStatusLabel("-- Mbps");
+            _bitrateLabel.AutoSize = true;
+            _bitrateLabel.BorderSides = ToolStripStatusLabelBorderSides.Left;
+            _bitrateLabel.BorderStyle = Border3DStyle.Etched;
+            _bitrateLabel.Padding = new Padding(5, 0, 5, 0);
+
+            _pingLabel = new ToolStripStatusLabel("-- ms");
+            _pingLabel.AutoSize = true;
+            _pingLabel.BorderSides = ToolStripStatusLabelBorderSides.Left;
+            _pingLabel.BorderStyle = Border3DStyle.Etched;
+            _pingLabel.Padding = new Padding(5, 0, 5, 0);
+
+            // Add labels to status strip
+            _statusStrip.Items.AddRange(new ToolStripItem[] {
+                _statusLabel,
+                _fpsLabel,
+                _bitrateLabel,
+                _pingLabel
+            });
+
+            // Add status strip to form
+            Controls.Add(_statusStrip);
+
+            // Set initial visibility of performance info
+            SetPerformanceInfoVisibility(_isPerformanceInfoVisible);
+        }
+
+        private void SetPerformanceInfoVisibility(bool visible)
+        {
+            _isPerformanceInfoVisible = visible;
+            _fpsLabel.Visible = visible;
+            _bitrateLabel.Visible = visible;
+            _pingLabel.Visible = visible;
+        }
+
+        private void OnKeyDown(object sender, KeyEventArgs e)
+        {
+            // Ctrl+P to toggle performance info
+            if (e.Control && e.KeyCode == Keys.P)
+            {
+                SetPerformanceInfoVisibility(!_isPerformanceInfoVisible);
+                e.Handled = true;
+            }
+
+            // Ctrl+D to toggle debug console
+            if (e.Control && e.KeyCode == Keys.D)
+            {
+                ConsoleHelper.ShowConsoleWindow();
+                e.Handled = true;
+            }
+        }
+
+        private void OnStatusUpdateTick(object sender, EventArgs e)
+        {
+            // Update performance info in status bar
+            if (_isPerformanceInfoVisible)
+            {
+                _fpsLabel.Text = $"FPS: {_currentMetrics.CurrentFps:F1}";
+                _bitrateLabel.Text = $"{_currentMetrics.CurrentBitrateMbps:F1} Mbps";
+                _pingLabel.Text = $"{_currentMetrics.Ping} ms";
+            }
+        }
+
+        private void OnPerformanceUpdated(object sender, PerformanceMetrics metrics)
+        {
+            _currentMetrics = metrics;
         }
 
         private void Cleanup()
         {
             lock (_syncLock)
             {
-                lblStatus.Text = "상태: 종료 중...";
+                lblStatus.Text = "Status: Shutting down...";
 
                 _networkUpdateTimer?.Stop();
+                _statusUpdateTimer?.Stop();
                 _screenCapture?.Stop();
                 _networkClient?.Stop();
 
@@ -89,7 +207,8 @@ namespace ScreenShare.Client.Forms
                 _encoder?.Dispose();
                 _networkClient?.Dispose();
 
-                FileLogger.Instance.WriteInfo("메인 폼 종료");
+                EnhancedLogger.Instance.Info("Main form closed");
+                EnhancedLogger.Instance.Dispose();
             }
         }
 
@@ -97,17 +216,16 @@ namespace ScreenShare.Client.Forms
         {
             try
             {
-                // 비트맵이 이미 클론되었으므로 여기서는 직접 인코딩
+                // Bitmap is already cloned so encode directly
                 _encoder.EncodeFrame(bitmap);
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("인코딩 오류", ex);
+                EnhancedLogger.Instance.Error("Encoding error", ex);
             }
             finally
             {
-                // bitmap은 OptimizedScreenCapture에서 클론으로 생성되었으므로
-                // 이 메서드에서 처리 후 반드시 해제해야 함
+                // Dispose bitmap as it was cloned in OptimizedScreenCapture
                 bitmap.Dispose();
             }
         }
@@ -123,7 +241,7 @@ namespace ScreenShare.Client.Forms
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("네트워크 전송 오류", ex);
+                EnhancedLogger.Instance.Error("Network transmission error", ex);
             }
         }
 
@@ -137,13 +255,13 @@ namespace ScreenShare.Client.Forms
 
             if (isConnected)
             {
-                lblStatus.Text = "상태: 화면 전송 중";
-                FileLogger.Instance.WriteInfo("연결됨: 화면 전송 중");
+                _statusLabel.Text = "Connected: Transmitting screen";
+                EnhancedLogger.Instance.Info("Connected: Transmitting screen");
             }
             else
             {
-                lblStatus.Text = "상태: 재연결 중...";
-                FileLogger.Instance.WriteInfo("연결 해제: 재연결 시도 중");
+                _statusLabel.Text = "Disconnected: Attempting reconnection...";
+                EnhancedLogger.Instance.Info("Disconnected: Attempting reconnection");
             }
         }
 
@@ -157,25 +275,21 @@ namespace ScreenShare.Client.Forms
 
             if (isActive)
             {
-                // 원격 제어 모드 활성화
-                _screenCapture.Fps = _settings.HighResFps;
-                _screenCapture.Quality = _settings.HighResQuality;
-                lblStatus.Text = "상태: 원격 제어 모드";
-                FileLogger.Instance.WriteInfo($"원격 제어 모드 활성화 (FPS: {_settings.HighResFps}, 품질: {_settings.HighResQuality})");
+                // Remote control mode activated
+                _statusLabel.Text = "Remote control mode active";
+                EnhancedLogger.Instance.Info($"Remote control mode activated (FPS: {_settings.HighResFps}, Quality: {_settings.HighResQuality})");
 
-                // 모든 설정에 우선순위 부여
+                // Set process priority higher for remote control
                 if (Process.GetCurrentProcess().PriorityClass != ProcessPriorityClass.AboveNormal)
                     Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.AboveNormal;
             }
             else
             {
-                // 일반 모드
-                _screenCapture.Fps = _settings.LowResFps;
-                _screenCapture.Quality = _settings.LowResQuality;
-                lblStatus.Text = "상태: 화면 전송 중";
-                FileLogger.Instance.WriteInfo($"일반 모드 전환 (FPS: {_settings.LowResFps}, 품질: {_settings.LowResQuality})");
+                // Normal mode
+                _statusLabel.Text = "Connected: Transmitting screen";
+                EnhancedLogger.Instance.Info($"Normal mode (FPS: {_settings.LowResFps}, Quality: {_settings.LowResQuality})");
 
-                // 프로세스 우선순위 정상화
+                // Reset process priority
                 if (Process.GetCurrentProcess().PriorityClass != ProcessPriorityClass.Normal)
                     Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.Normal;
             }
@@ -189,7 +303,7 @@ namespace ScreenShare.Client.Forms
                 return;
             }
 
-            // 원격 제어 명령 처리
+            // Handle remote control commands
             switch (packet.Type)
             {
                 case PacketType.MouseMove:
@@ -208,13 +322,13 @@ namespace ScreenShare.Client.Forms
                             packet.MouseX.Value,
                             packet.MouseY.Value);
 
-                        // 마우스 클릭 이벤트 시뮬레이션
-                        if (packet.MouseButton.Value == 0) // 왼쪽 클릭
+                        // Mouse click simulation
+                        if (packet.MouseButton.Value == 0) // Left click
                         {
                             MouseOperations.MouseEvent(MouseOperations.MouseEventFlags.LeftDown);
                             MouseOperations.MouseEvent(MouseOperations.MouseEventFlags.LeftUp);
                         }
-                        else if (packet.MouseButton.Value == 1) // 오른쪽 클릭
+                        else if (packet.MouseButton.Value == 1) // Right click
                         {
                             MouseOperations.MouseEvent(MouseOperations.MouseEventFlags.RightDown);
                             MouseOperations.MouseEvent(MouseOperations.MouseEventFlags.RightUp);
@@ -225,7 +339,7 @@ namespace ScreenShare.Client.Forms
                 case PacketType.KeyPress:
                     if (packet.KeyCode.HasValue)
                     {
-                        // 키보드 이벤트 시뮬레이션
+                        // Keyboard event simulation
                         KeyboardOperations.KeyDown((Keys)packet.KeyCode.Value);
                         KeyboardOperations.KeyUp((Keys)packet.KeyCode.Value);
                     }
@@ -234,7 +348,7 @@ namespace ScreenShare.Client.Forms
         }
     }
 
-    // 마우스 이벤트 시뮬레이션을 위한 유틸리티 클래스
+    // Mouse event simulation (unchanged)
     public static class MouseOperations
     {
         [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -254,7 +368,7 @@ namespace ScreenShare.Client.Forms
         }
     }
 
-    // 키보드 이벤트 시뮬레이션을 위한 유틸리티 클래스
+    // Keyboard event simulation (unchanged)
     public static class KeyboardOperations
     {
         [System.Runtime.InteropServices.DllImport("user32.dll")]

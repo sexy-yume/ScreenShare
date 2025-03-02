@@ -1,9 +1,9 @@
-﻿// ScreenShare.Client/Network/NetworkClient.cs
-using System;
+﻿using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Diagnostics;
+using System.Collections.Concurrent;
 using LiteNetLib;
 using LiteNetLib.Utils;
 using ScreenShare.Common.Models;
@@ -14,6 +14,7 @@ namespace ScreenShare.Client.Network
 {
     public class NetworkClient : INetEventListener, IDisposable
     {
+        // Existing fields
         private NetManager _netManager;
         private NetPeer _server;
         private ClientSettings _settings;
@@ -25,12 +26,21 @@ namespace ScreenShare.Client.Network
         private long _bytesSent = 0;
         private int _framesSent = 0;
 
+        // New fields for adaptive frame management
+        private AdaptiveFrameManager _adaptiveManager;
+        private ConcurrentDictionary<long, DateTime> _pendingFrames = new ConcurrentDictionary<long, DateTime>();
+        private long _nextFrameId = 1;
+        private PerformanceMetrics _metrics = new PerformanceMetrics();
+
+        // Events (existing and new)
         public event EventHandler<bool> RemoteControlStatusChanged;
         public event EventHandler<ScreenPacket> RemoteControlReceived;
         public event EventHandler<bool> ConnectionStatusChanged;
+        public event EventHandler<PerformanceMetrics> PerformanceUpdated;
 
         public bool IsConnected => _server != null && _server.ConnectionState == ConnectionState.Connected;
         public bool IsRemoteControlActive => _isRemoteControlActive;
+        public AdaptiveFrameManager AdaptiveManager => _adaptiveManager;
 
         public NetworkClient(ClientSettings settings)
         {
@@ -42,20 +52,41 @@ namespace ScreenShare.Client.Network
                 NatPunchEnabled = true,
                 ReconnectDelay = 500,
                 MaxConnectAttempts = 10,
-                PingInterval = 1000,
+                PingInterval = 500,       // More frequent pings (was 1000)
                 DisconnectTimeout = 5000
             };
 
             _sendStatsTimer.Start();
+
+            // Initialize adaptive frame manager
+            _adaptiveManager = new AdaptiveFrameManager(
+                settings.LowResFps,
+                settings.LowResQuality,
+                10_000_000);  // Initial bitrate: 10 Mbps
+
+            _adaptiveManager.SettingsChanged += OnAdaptiveSettingsChanged;
+        }
+
+        // New method to handle adaptive settings changes
+        private void OnAdaptiveSettingsChanged(object sender, AdaptiveSettingsChangedEventArgs e)
+        {
+            // Update metrics
+            _metrics.TargetFps = e.TargetFps;
+            _metrics.EncodingQuality = e.Quality;
+            _metrics.TargetBitrate = e.Bitrate;
+
+            // Notify listeners
+            PerformanceUpdated?.Invoke(this, _metrics);
         }
 
         public void Start()
         {
-            Console.WriteLine("네트워크 클라이언트 시작");
+            EnhancedLogger.Instance.Info("Network client starting");
             _netManager.Start();
             Connect();
         }
 
+        // Existing Connect method
         public void Connect()
         {
             if (_isConnecting)
@@ -64,14 +95,14 @@ namespace ScreenShare.Client.Network
             _isConnecting = true;
             _connectionTimer.Restart();
 
-            Console.WriteLine($"호스트 연결 시도: {_settings.HostIp}:{_settings.HostPort}");
+            EnhancedLogger.Instance.Info($"Connecting to host: {_settings.HostIp}:{_settings.HostPort}");
             _netManager.Connect(_settings.HostIp, _settings.HostPort, "ScreenShare");
 
-            // 연결 상태 주기적으로 로깅
+            // Connection monitoring thread
             new Thread(() => {
                 while (_isConnecting && _connectionTimer.ElapsedMilliseconds < 10000)
                 {
-                    Console.WriteLine($"연결 대기 중... ({_connectionTimer.ElapsedMilliseconds / 1000}초)");
+                    EnhancedLogger.Instance.Info($"Waiting for connection... ({_connectionTimer.ElapsedMilliseconds / 1000}s)");
                     Thread.Sleep(1000);
                 }
                 _isConnecting = false;
@@ -81,20 +112,36 @@ namespace ScreenShare.Client.Network
 
         public void Stop()
         {
-            Console.WriteLine("네트워크 클라이언트 종료");
+            EnhancedLogger.Instance.Info("Network client stopping");
             _isConnecting = false;
             _netManager.Stop();
+            _adaptiveManager?.Dispose();
         }
 
-        public void SendScreenData(byte[] data, int width, int height)
+        // Modified method to implement frame flow control
+        public bool SendScreenData(byte[] data, int width, int height)
         {
             if (!IsConnected || data == null || data.Length == 0)
-                return;
+                return false;
+
+            // Check with adaptive manager if we should send this frame
+            if (!_adaptiveManager.BeginFrameSend())
+            {
+                // Skip this frame based on adaptive rate control
+                return false;
+            }
 
             lock (_sendLock)
             {
                 try
                 {
+                    // Generate frame ID for tracking
+                    long frameId = _nextFrameId++;
+
+                    // Store send time for RTT calculation
+                    _pendingFrames[frameId] = DateTime.UtcNow;
+
+                    // Create packet with frame ID
                     var packet = new ScreenPacket
                     {
                         Type = PacketType.ScreenData,
@@ -102,31 +149,59 @@ namespace ScreenShare.Client.Network
                         ScreenData = data,
                         Width = width,
                         Height = height,
-                        Timestamp = DateTimeOffset.Now.ToUnixTimeMilliseconds()
+                        Timestamp = DateTimeOffset.Now.ToUnixTimeMilliseconds(),
+                        FrameId = frameId
                     };
 
                     byte[] serializedData = PacketSerializer.Serialize(packet);
                     _server.Send(serializedData, DeliveryMethod.ReliableOrdered);
 
+                    // Log frame sending periodically
+                    if (frameId % 30 == 0)
+                    {
+                        EnhancedLogger.Instance.Debug($"Sent frame id={frameId}, size={serializedData.Length}, pending={_pendingFrames.Count}");
+                    }
+
                     _bytesSent += serializedData.Length;
                     _framesSent++;
 
-                    // 주기적으로 네트워크 통계 출력
+                    // Update metrics
+                    _metrics.LastFrameSize = serializedData.Length;
+                    _metrics.TotalBytesSent += serializedData.Length;
+                    _metrics.TotalFramesSent++;
+
+                    // Log network statistics periodically
                     if (_sendStatsTimer.ElapsedMilliseconds >= 5000)
                     {
                         double seconds = _sendStatsTimer.ElapsedMilliseconds / 1000.0;
                         double mbps = (_bytesSent * 8.0 / 1_000_000.0) / seconds;
                         double fps = _framesSent / seconds;
-                        Console.WriteLine($"네트워크 통계: {mbps:F2} Mbps, {fps:F1} fps, 지연: {_server.Ping}ms");
+
+                        _metrics.CurrentBitrateMbps = mbps;
+                        _metrics.CurrentFps = fps;
+                        _metrics.Ping = _server.Ping;
+
+                        EnhancedLogger.Instance.Info(
+                            $"Network stats: {mbps:F2} Mbps, {fps:F1} fps, RTT: {_server.Ping}ms, " +
+                            $"Pending: {_pendingFrames.Count}, Packet loss: {_server.Statistics.PacketLossPercent:F1}%");
+
+                        // Update adaptive manager with packet loss info
+                        _adaptiveManager.UpdatePacketLoss((int)_server.Statistics.PacketLossPercent);
+
+                        // Notify listeners
+                        PerformanceUpdated?.Invoke(this, _metrics);
 
                         _bytesSent = 0;
                         _framesSent = 0;
                         _sendStatsTimer.Restart();
                     }
+
+                    return true;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"데이터 전송 오류: {ex.Message}");
+                    EnhancedLogger.Instance.Error($"Data send error: {ex.Message}", ex);
+                    return false;
                 }
             }
         }
@@ -134,15 +209,28 @@ namespace ScreenShare.Client.Network
         public void Update()
         {
             _netManager.PollEvents();
+
+            // Check for timed-out frames (unacknowledged for > 5 seconds)
+            var now = DateTime.UtcNow;
+            foreach (var frame in _pendingFrames)
+            {
+                if ((now - frame.Value).TotalSeconds > 5)
+                {
+                    if (_pendingFrames.TryRemove(frame.Key, out _))
+                    {
+                        EnhancedLogger.Instance.Debug($"Frame {frame.Key} timed out waiting for acknowledgment");
+                    }
+                }
+            }
         }
 
         public void OnPeerConnected(NetPeer peer)
         {
             _server = peer;
             _isConnecting = false;
-            Console.WriteLine($"호스트 연결됨: {peer.EndPoint}, 연결 시간: {_connectionTimer.ElapsedMilliseconds}ms");
+            EnhancedLogger.Instance.Info($"Host connected: {peer.EndPoint}, connection time: {_connectionTimer.ElapsedMilliseconds}ms");
 
-            // 초기 연결 정보 전송
+            // Send initial connection info
             var packet = new ScreenPacket
             {
                 Type = PacketType.Connect,
@@ -157,24 +245,24 @@ namespace ScreenShare.Client.Network
 
         public void OnPeerDisconnected(NetPeer peer, DisconnectInfo disconnectInfo)
         {
-            Console.WriteLine($"호스트 연결 해제: {disconnectInfo.Reason}");
+            EnhancedLogger.Instance.Info($"Host disconnected: {disconnectInfo.Reason}");
             _server = null;
 
-            // 원격 제어 모드 해제
+            // Disable remote control mode
             SetRemoteControlMode(false);
             ConnectionStatusChanged?.Invoke(this, false);
 
-            // 자동 재연결 (1초 후)
+            // Auto-reconnect after 1 second
             Thread.Sleep(1000);
             Connect();
         }
 
         public void OnNetworkError(IPEndPoint endPoint, SocketError socketError)
         {
-            Console.WriteLine($"네트워크 오류: {endPoint} - {socketError}");
+            EnhancedLogger.Instance.Error($"Network error: {endPoint} - {socketError}", null);
         }
 
-        // LiteNetLib 최신 버전에 맞게 메서드 시그니처 업데이트
+        // Modified OnNetworkReceive to handle frame acknowledgments
         public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNumber, DeliveryMethod deliveryMethod)
         {
             try
@@ -182,15 +270,45 @@ namespace ScreenShare.Client.Network
                 byte[] data = reader.GetRemainingBytes();
                 var packet = PacketSerializer.Deserialize<ScreenPacket>(data);
 
+                // Check for frame acknowledgment
+                if (packet.Type == PacketType.FrameAck)
+                {
+                    EnhancedLogger.Instance.Debug($"Received frame ack: id={packet.FrameId}, time={packet.Timestamp/1000.0}ms, queue={packet.Width}");
+
+                    // Calculate RTT
+                    if (_pendingFrames.TryRemove(packet.FrameId, out DateTime sentTime))
+                    {
+                        int rtt = (int)(DateTime.UtcNow - sentTime).TotalMilliseconds;
+
+                        // Update adaptive manager
+                        _adaptiveManager.FrameAcknowledged(packet.FrameId, rtt);
+
+                        // Update metrics
+                        _metrics.Ping = rtt;
+                        _metrics.HostQueueLength = packet.Width;  // Queue length is stored in Width
+                        _metrics.HostProcessingTime = packet.Timestamp / 1000.0; // Processing time in Timestamp field
+                        _metrics.PacketLoss = packet.Height / 100;  // Packet loss in Height field (scaled)
+
+                        EnhancedLogger.Instance.Debug($"Processed ack: id={packet.FrameId}, rtt={rtt}ms, queue={packet.Width}");
+                    }
+                    else
+                    {
+                        EnhancedLogger.Instance.Debug($"Received ack for unknown frame: id={packet.FrameId}");
+                    }
+
+                    return;
+                }
+
+                // Handle other packet types
                 switch (packet.Type)
                 {
                     case PacketType.RemoteControl:
-                        Console.WriteLine("원격 제어 요청 수신");
+                        EnhancedLogger.Instance.Info("Remote control request received");
                         SetRemoteControlMode(true);
                         break;
 
                     case PacketType.RemoteEnd:
-                        Console.WriteLine("원격 제어 종료 수신");
+                        EnhancedLogger.Instance.Info("Remote control end received");
                         SetRemoteControlMode(false);
                         break;
 
@@ -206,7 +324,7 @@ namespace ScreenShare.Client.Network
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"패킷 처리 오류: {ex.Message}");
+                EnhancedLogger.Instance.Error($"Packet processing error: {ex.Message}", ex);
             }
             finally
             {
@@ -219,30 +337,55 @@ namespace ScreenShare.Client.Network
             if (_isRemoteControlActive != active)
             {
                 _isRemoteControlActive = active;
-                Console.WriteLine($"원격 제어 모드 변경: {active}");
+                EnhancedLogger.Instance.Info($"Remote control mode changed: {active}");
                 RemoteControlStatusChanged?.Invoke(this, active);
+
+                // Notify adaptive manager of mode change
+                _adaptiveManager.SetRemoteControlMode(active);
             }
         }
 
+        // Implement all required interface methods
         public void OnNetworkReceiveUnconnected(IPEndPoint remoteEndPoint, NetPacketReader reader, UnconnectedMessageType messageType)
         {
+            // Not used in this application
         }
 
         public void OnNetworkLatencyUpdate(NetPeer peer, int latency)
         {
+            // Could be used to update metrics if needed
             if (latency > 500)
             {
-                Console.WriteLine($"네트워크 지연 높음: {latency}ms");
+                EnhancedLogger.Instance.Debug($"High network latency: {latency}ms");
             }
         }
 
         public void OnConnectionRequest(ConnectionRequest request)
         {
+            // Client doesn't accept incoming connections
+            request.Reject();
         }
 
         public void Dispose()
         {
             Stop();
         }
+    }
+
+    // Performance metrics class
+    public class PerformanceMetrics
+    {
+        public double CurrentBitrateMbps { get; set; }
+        public double CurrentFps { get; set; }
+        public int TargetFps { get; set; }
+        public int EncodingQuality { get; set; }
+        public int TargetBitrate { get; set; }
+        public int Ping { get; set; }
+        public int PacketLoss { get; set; }
+        public int HostQueueLength { get; set; }
+        public double HostProcessingTime { get; set; } // In milliseconds
+        public long TotalBytesSent { get; set; }
+        public long TotalFramesSent { get; set; }
+        public int LastFrameSize { get; set; }
     }
 }

@@ -1,5 +1,4 @@
-﻿// ScreenShare.Client/Forms/LoginForm.Designer.cs
-namespace ScreenShare.Client.Forms
+﻿namespace ScreenShare.Client.Forms
 {
     partial class LoginForm
     {

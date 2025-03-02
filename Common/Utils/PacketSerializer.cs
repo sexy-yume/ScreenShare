@@ -1,5 +1,4 @@
-﻿// ScreenShare.Common/Utils/PacketSerializer.cs
-using System;
+﻿using System;
 using System.IO;
 using System.Text.Json;
 using ScreenShare.Common.Models;

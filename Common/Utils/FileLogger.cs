@@ -1,5 +1,4 @@
-﻿// ScreenShare.Common/Utils/FileLogger.cs
-using System;
+﻿using System;
 using System.IO;
 using System.Text;
 using System.Threading;

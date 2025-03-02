@@ -15,6 +15,8 @@ namespace ScreenShare.Common.Models
         RemoteEnd,      // 원격 제어 종료
         MouseMove,      // 마우스 이동
         MouseClick,     // 마우스 클릭
-        KeyPress        // 키보드 입력
+        KeyPress,       // 키보드 입력
+        FrameAck,       // 프레임 수신 확인
+        NetworkStats    // 네트워크 통계
     }
 }

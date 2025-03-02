@@ -1,5 +1,4 @@
-﻿// ScreenShare.Common/Settings/ClientSettings.cs
-using System;
+﻿using System;
 using System.IO;
 using Newtonsoft.Json;
 

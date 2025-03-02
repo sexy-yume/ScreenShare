@@ -1,40 +1,73 @@
-﻿// ScreenShare.Host/Decoder/FFmpegDecoder.cs
-using System;
+﻿using System;
 using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.Text;
+using System.Threading;
 using FFmpeg.AutoGen;
 
 namespace ScreenShare.Host.Decoder
 {
     public unsafe class FFmpegDecoder : IDisposable
     {
+        // Core FFmpeg components
         private AVCodec* _codec;
         private AVCodecContext* _context;
         private AVFrame* _frame;
         private AVPacket* _packet;
         private SwsContext* _swsContext;
 
+        // Dimensions and state tracking
         private int _width;
         private int _height;
         private bool _isInitialized;
         private readonly object _decodeLock = new object();
-        private Stopwatch _performanceTimer = new Stopwatch();
-        private long _frameCount = 0;
         private bool _isDisposed = false;
 
-        public event EventHandler<Bitmap> FrameDecoded;
+        // Performance tracking
+        private readonly Stopwatch _performanceTimer = new Stopwatch();
+        private long _frameCount = 0;
+        private long _totalDecodeTime = 0;
+        private long _totalSwscaleTime = 0;
+        private long _totalBitmapTime = 0;
+        private readonly TimeSpan _logInterval = TimeSpan.FromSeconds(10);
+        private DateTime _lastLogTime = DateTime.MinValue;
 
-        public FFmpegDecoder()
+        // Decoder options
+        private bool _useHardwareAcceleration = true;
+        private int _threadCount = 2;
+        private bool _enableVerboseLogging = false;
+
+        // Events
+        public event EventHandler<Bitmap> FrameDecoded;
+        public event EventHandler<DecoderPerformanceMetrics> PerformanceUpdated;
+
+        public class DecoderPerformanceMetrics
         {
+            public double AverageDecodeTimeMs { get; set; }
+            public double AverageSwscaleTimeMs { get; set; }
+            public double AverageBitmapTimeMs { get; set; }
+            public double TotalProcessingTimeMs { get; set; }
+            public long TotalFramesDecoded { get; set; }
+            public double DecodeFps { get; set; }
+        }
+
+        public FFmpegDecoder(bool useHardwareAcceleration = true, int threadCount = 2)
+        {
+            _useHardwareAcceleration = useHardwareAcceleration;
+            _threadCount = threadCount;
+
             InitializeFFmpeg();
             _performanceTimer.Start();
         }
 
+        public void SetVerboseLogging(bool enabled)
+        {
+            _enableVerboseLogging = enabled;
+        }
+
         private string GetErrorMessage(int errorCode)
         {
-            // FFmpeg 오류 메시지 가져오기
             const int bufferSize = 1024;
             var buffer = new byte[bufferSize];
 
@@ -46,200 +79,245 @@ namespace ScreenShare.Host.Decoder
             return Encoding.UTF8.GetString(buffer).TrimEnd('\0');
         }
 
-        // FFmpegDecoder.cs의 InitializeFFmpeg 메소드에서 오류 수정
         private void InitializeFFmpeg()
         {
             try
             {
-                Console.WriteLine("FFmpeg 디코더 초기화 시작");
+                Console.WriteLine("Initializing FFmpeg decoder");
 
-                // H.264 코덱 선택
+                // Find H.264 codec
                 _codec = ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_H264);
                 if (_codec == null)
-                    throw new Exception("H.264 코덱을 찾을 수 없습니다.");
+                    throw new Exception("H.264 codec not found");
 
-                // 코덱 컨텍스트 초기화
+                // Initialize codec context
                 _context = ffmpeg.avcodec_alloc_context3(_codec);
-                _context->flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY;  // 낮은 지연 설정
-                _context->thread_count = 4;  // 멀티스레딩 설정
 
-                // H.264 세부 설정 추가
-                _context->flags2 |= ffmpeg.AV_CODEC_FLAG2_FAST; // 빠른 디코딩 활성화
+                // Set low-latency flags
+                _context->flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY;
+                _context->flags2 |= ffmpeg.AV_CODEC_FLAG2_FAST;
 
-                // 코덱 열기
+                // Set threading model
+                _context->thread_count = _threadCount;
+                _context->thread_type = ffmpeg.FF_THREAD_SLICE;  // Use slice threading for lower latency
+
+                // Reduce error sensitivity
+                _context->err_recognition = ffmpeg.AV_EF_EXPLODE; // Only fail on critical errors
+
+                // Open codec with appropriate options
                 AVDictionary* opts = null;
-                ffmpeg.av_dict_set(&opts, "threads", "auto", 0);  // 멀티스레딩 활성화
+                ffmpeg.av_dict_set(&opts, "threads", _threadCount.ToString(), 0);
+                ffmpeg.av_dict_set(&opts, "refcounted_frames", "1", 0);
 
-                // 중요: H.264 특화 옵션 추가
-                ffmpeg.av_dict_set(&opts, "refcounted_frames", "1", 0); // 참조 카운팅 프레임 사용
-
-                // H.264 디코딩 설정 추가
-                // 첫 I-프레임이 아니어도 디코딩 시작
+                // Fast decoding settings
                 ffmpeg.av_dict_set(&opts, "flags", "low_delay", 0);
                 ffmpeg.av_dict_set(&opts, "flags2", "fast", 0);
 
-                // 에러 감지 완화
-                _context->err_recognition = 0;
+                // Latency-focused settings
+                ffmpeg.av_dict_set(&opts, "strict", "experimental", 0);
 
                 int result = ffmpeg.avcodec_open2(_context, _codec, &opts);
                 if (result < 0)
                 {
                     string errorMsg = GetErrorMessage(result);
-                    throw new Exception($"코덱을 열 수 없습니다: {errorMsg}");
+                    throw new Exception($"Failed to open codec: {errorMsg}");
                 }
 
-                // 프레임 초기화
+                // Allocate frame
                 _frame = ffmpeg.av_frame_alloc();
 
-                // 패킷 초기화
+                // Allocate packet
                 _packet = ffmpeg.av_packet_alloc();
 
-                Console.WriteLine("FFmpeg 디코더 초기화 완료");
+                Console.WriteLine("FFmpeg decoder initialized successfully");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"FFmpeg 디코더 초기화 오류: {ex.Message}");
+                Console.WriteLine($"FFmpeg decoder initialization error: {ex.Message}");
                 Dispose();
                 throw;
             }
         }
 
-        // FFmpegDecoder.cs의 DecodeFrame 메서드 수정
-        public Bitmap DecodeFrame(byte[] data, int width, int height)
+        public Bitmap DecodeFrame(byte[] data, int width, int height, long frameId)
         {
             if (_isDisposed || data == null || data.Length == 0)
                 return null;
 
             Bitmap result = null;
+
+            Stopwatch sw = Stopwatch.StartNew();
+            Stopwatch sectionTimer = new Stopwatch();
+            long decodeTime = 0, swscaleTime = 0, bitmapTime = 0;
+
             lock (_decodeLock)
             {
-                Stopwatch sw = Stopwatch.StartNew();
-                Console.WriteLine($"디코딩 시작: 데이터 크기={data.Length}, 목표 해상도={width}x{height}");
-
                 try
                 {
-                    // 크기가 변경되었거나 첫 프레임인 경우 초기화
+                    LogVerbose($"Starting decode: size={data.Length}, dims={width}x{height}");
+
+                    // Update dimensions if needed
                     if (_width != width || _height != height || !_isInitialized)
                     {
-                        Console.WriteLine($"디코더 크기 변경: {width}x{height}");
+                        LogVerbose($"Resizing decoder to {width}x{height}");
                         _width = width;
                         _height = height;
 
-                        // SWS 컨텍스트 초기화 (YUV420P -> RGBA 변환)
+                        // Free existing scaler if any
                         if (_swsContext != null)
                         {
                             ffmpeg.sws_freeContext(_swsContext);
                         }
 
+                        // Create new scaler context - use fast bilinear for low latency
                         _swsContext = ffmpeg.sws_getContext(
                             width, height, AVPixelFormat.AV_PIX_FMT_YUV420P,
                             width, height, AVPixelFormat.AV_PIX_FMT_BGRA,
                             ffmpeg.SWS_FAST_BILINEAR, null, null, null);
 
                         if (_swsContext == null)
-                            throw new Exception("SWS 컨텍스트 초기화 실패");
+                            throw new Exception("Failed to initialize SWS context");
 
                         _isInitialized = true;
                     }
 
-                    // 패킷 데이터 설정
+                    // Set packet data
+                    sectionTimer.Start();
                     fixed (byte* ptr = data)
                     {
                         _packet->data = ptr;
                         _packet->size = data.Length;
+                        _packet->pts = frameId;
+                        _packet->dts = frameId;
 
-                        // 파싱 플래그 설정 및 시간 정보 설정
-                        _packet->flags = 0;
-                        _packet->pts = _frameCount;
-                        _packet->dts = _frameCount;
-
-                        // 패킷 디코딩
+                        // Send packet to decoder
                         int ret = ffmpeg.avcodec_send_packet(_context, _packet);
                         if (ret < 0)
                         {
                             string errorMsg = GetErrorMessage(ret);
-                            Console.WriteLine($"패킷 디코딩 실패: {errorMsg}, 코드: {ret}");
+                            LogVerbose($"Packet decode failed: {errorMsg}, code: {ret}");
                             return null;
                         }
 
-                        Console.WriteLine("패킷 전송 성공, 프레임 수신 대기");
-                        bool frameReceived = false;
-
-                        while (ret >= 0)
+                        // Receive decoded frame
+                        ret = ffmpeg.avcodec_receive_frame(_context, _frame);
+                        if (ret < 0)
                         {
-                            ret = ffmpeg.avcodec_receive_frame(_context, _frame);
-                            if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF)
-                            {
-                                Console.WriteLine($"더 이상 프레임 없음: {(ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) ? "EAGAIN" : "EOF")}");
-                                break;
-                            }
-
-                            if (ret < 0)
+                            if (ret != ffmpeg.AVERROR(ffmpeg.EAGAIN) && ret != ffmpeg.AVERROR_EOF)
                             {
                                 string errorMsg = GetErrorMessage(ret);
-                                Console.WriteLine($"프레임 수신 실패: {errorMsg}, 코드: {ret}");
-                                break;
+                                LogVerbose($"Frame receive failed: {errorMsg}, code: {ret}");
                             }
-
-                            Console.WriteLine($"프레임 수신 성공: 포맷={_frame->format}, 크기={_frame->width}x{_frame->height}");
-                            frameReceived = true;
-
-                            // 디코딩된 프레임 정보 출력
-                            Console.WriteLine($"YUV 데이터: Y_linesize={_frame->linesize[0]}, U_linesize={_frame->linesize[1]}, V_linesize={_frame->linesize[2]}");
-
-                            // 비트맵 생성
-                            result = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-                            var bitmapData = result.LockBits(
-                                new Rectangle(0, 0, width, height),
-                                System.Drawing.Imaging.ImageLockMode.WriteOnly,
-                                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-
-                            // YUV420P -> BGRA 변환
-                            byte_ptrArray4 srcDataPtr = new byte_ptrArray4();
-                            srcDataPtr[0] = _frame->data[0];
-                            srcDataPtr[1] = _frame->data[1];
-                            srcDataPtr[2] = _frame->data[2];
-                            int_array4 srcStrides = new int_array4();
-                            srcStrides[0] = _frame->linesize[0];
-                            srcStrides[1] = _frame->linesize[1];
-                            srcStrides[2] = _frame->linesize[2];
-
-                            byte_ptrArray4 dstDataPtr = new byte_ptrArray4();
-                            dstDataPtr[0] = (byte*)bitmapData.Scan0;
-                            int_array4 dstStrides = new int_array4();
-                            dstStrides[0] = bitmapData.Stride;
-
-                            int scaleResult = ffmpeg.sws_scale(_swsContext, srcDataPtr, srcStrides, 0, height, dstDataPtr, dstStrides);
-                            Console.WriteLine($"변환된 라인 수: {scaleResult}");
-
-                            result.UnlockBits(bitmapData);
-
-                            _frameCount++;
-                            Console.WriteLine($"비트맵 생성 완료: 해상도={result.Width}x{result.Height}, 포맷={result.PixelFormat}");
-
-                            // 프레임 수신 즉시 종료
-                            break;
-                        }
-
-                        if (!frameReceived)
-                        {
-                            Console.WriteLine("유효한 프레임이 디코딩되지 않았습니다. 다음 패킷을 기다립니다.");
+                            return null;
                         }
                     }
+                    sectionTimer.Stop();
+                    decodeTime = sectionTimer.ElapsedTicks;
+                    LogVerbose($"Frame decoded: format={_frame->format}, dims={_frame->width}x{_frame->height}");
 
-                    sw.Stop();
-                    if (_frameCount % 30 == 0)
-                    {
-                        Console.WriteLine($"디코딩 시간: {sw.ElapsedMilliseconds}ms, 총 프레임: {_frameCount}, 평균: {_performanceTimer.ElapsedMilliseconds / (double)_frameCount:F2}ms/프레임");
-                    }
+                    // Create bitmap
+                    sectionTimer.Restart();
+                    result = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                    var bitmapData = result.LockBits(
+                        new Rectangle(0, 0, width, height),
+                        System.Drawing.Imaging.ImageLockMode.WriteOnly,
+                        System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+
+                    // Pointers for YUV -> RGB conversion
+                    byte_ptrArray4 srcDataPtr = new byte_ptrArray4();
+                    srcDataPtr[0] = _frame->data[0];
+                    srcDataPtr[1] = _frame->data[1];
+                    srcDataPtr[2] = _frame->data[2];
+                    int_array4 srcStrides = new int_array4();
+                    srcStrides[0] = _frame->linesize[0];
+                    srcStrides[1] = _frame->linesize[1];
+                    srcStrides[2] = _frame->linesize[2];
+
+                    byte_ptrArray4 dstDataPtr = new byte_ptrArray4();
+                    dstDataPtr[0] = (byte*)bitmapData.Scan0;
+                    int_array4 dstStrides = new int_array4();
+                    dstStrides[0] = bitmapData.Stride;
+                    sectionTimer.Stop();
+                    bitmapTime = sectionTimer.ElapsedTicks;
+
+                    // Scale image
+                    sectionTimer.Restart();
+                    ffmpeg.sws_scale(_swsContext, srcDataPtr, srcStrides, 0, height, dstDataPtr, dstStrides);
+                    sectionTimer.Stop();
+                    swscaleTime = sectionTimer.ElapsedTicks;
+
+                    result.UnlockBits(bitmapData);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"디코딩 오류: {ex.Message}\n{ex.StackTrace}");
+                    Console.WriteLine($"Decode error: {ex.Message}\n{ex.StackTrace}");
+                    if (result != null)
+                    {
+                        result.Dispose();
+                        result = null;
+                    }
+                }
+                finally
+                {
+                    sw.Stop();
+
+                    // Convert from ticks to ms
+                    double ticksToMs = 1000.0 / Stopwatch.Frequency;
+                    double decodeMs = decodeTime * ticksToMs;
+                    double swscaleMs = swscaleTime * ticksToMs;
+                    double bitmapMs = bitmapTime * ticksToMs;
+                    double totalMs = sw.ElapsedTicks * ticksToMs;
+
+                    // Update performance stats
+                    _frameCount++;
+                    _totalDecodeTime += decodeTime;
+                    _totalSwscaleTime += swscaleTime;
+                    _totalBitmapTime += bitmapTime;
+
+                    // Log performance periodically
+                    DateTime now = DateTime.Now;
+                    if ((now - _lastLogTime) > _logInterval || _enableVerboseLogging)
+                    {
+                        double totalSeconds = _performanceTimer.ElapsedMilliseconds / 1000.0;
+                        double fps = _frameCount / totalSeconds;
+
+                        var metrics = new DecoderPerformanceMetrics
+                        {
+                            AverageDecodeTimeMs = (_totalDecodeTime * ticksToMs) / _frameCount,
+                            AverageSwscaleTimeMs = (_totalSwscaleTime * ticksToMs) / _frameCount,
+                            AverageBitmapTimeMs = (_totalBitmapTime * ticksToMs) / _frameCount,
+                            TotalProcessingTimeMs = totalMs,
+                            TotalFramesDecoded = _frameCount,
+                            DecodeFps = fps
+                        };
+
+                        Console.WriteLine(
+                            $"Decoder stats: Frames={_frameCount}, FPS={fps:F1}, " +
+                            $"Decode={metrics.AverageDecodeTimeMs:F2}ms, " +
+                            $"Scale={metrics.AverageSwscaleTimeMs:F2}ms, " +
+                            $"Bitmap={metrics.AverageBitmapTimeMs:F2}ms, " +
+                            $"Total={totalMs:F2}ms");
+
+                        PerformanceUpdated?.Invoke(this, metrics);
+
+                        _lastLogTime = now;
+                    }
+                    else if (_enableVerboseLogging)
+                    {
+                        LogVerbose($"Frame {frameId} timing: Decode={decodeMs:F2}ms, Scale={swscaleMs:F2}ms, Bitmap={bitmapMs:F2}ms, Total={totalMs:F2}ms");
+                    }
                 }
             }
 
             return result;
+        }
+
+        private void LogVerbose(string message)
+        {
+            if (_enableVerboseLogging)
+            {
+                Console.WriteLine($"[DECODER] {message}");
+            }
         }
 
         public void Dispose()
@@ -250,7 +328,13 @@ namespace ScreenShare.Host.Decoder
             _isDisposed = true;
             _performanceTimer.Stop();
 
-            Console.WriteLine($"FFmpeg 디코더 종료. 총 {_frameCount}개 프레임 디코딩, 평균 처리 시간: {(_frameCount > 0 ? _performanceTimer.ElapsedMilliseconds / (double)_frameCount : 0):F2}ms/프레임");
+            double totalSeconds = _performanceTimer.ElapsedMilliseconds / 1000.0;
+            double fps = totalSeconds > 0 ? _frameCount / totalSeconds : 0;
+            double decodeAvg = _frameCount > 0 ? (_totalDecodeTime * 1000.0 / Stopwatch.Frequency) / _frameCount : 0;
+
+            Console.WriteLine(
+                $"FFmpeg decoder disposed. Total frames: {_frameCount}, Avg FPS: {fps:F1}, " +
+                $"Avg decode time: {decodeAvg:F2}ms");
 
             lock (_decodeLock)
             {

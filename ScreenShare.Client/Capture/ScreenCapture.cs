@@ -1,5 +1,4 @@
-﻿// ScreenShare.Client/Capture/OptimizedScreenCapture.cs
-using System;
+﻿using System;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Threading;
@@ -201,7 +200,7 @@ namespace ScreenShare.Client.Capture
 
                     if (sleepTime > 0)
                     {
-                        FileLogger.Instance.WriteInfo($"sleepTime : {sleepTime}");
+                        //FileLogger.Instance.WriteInfo($"sleepTime : {sleepTime}");
                         Thread.Sleep(sleepTime);
                     }
                 }

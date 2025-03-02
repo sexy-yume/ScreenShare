@@ -4,6 +4,8 @@ using System.Windows.Forms;
 using ScreenShare.Host.Network;
 using ScreenShare.Common.Utils;
 using ScreenShare.Host.Rendering;
+using SharpDX.DXGI;
+using SharpDX;
 
 namespace ScreenShare.Host.Forms
 {
@@ -54,7 +56,7 @@ namespace ScreenShare.Host.Forms
             _renderPanel = new Panel
             {
                 Dock = DockStyle.Fill,
-                BackColor = Color.Black
+                BackColor = System.Drawing.Color.Black
             };
 
             // Event handlers
@@ -109,7 +111,7 @@ namespace ScreenShare.Host.Forms
             Bitmap waitingImage = new Bitmap(800, 600);
             using (Graphics g = Graphics.FromImage(waitingImage))
             {
-                g.Clear(Color.DarkBlue);
+                g.Clear(System.Drawing.Color.DarkBlue);
 
                 // Add text
                 using (Font font = new Font("Arial", 24, FontStyle.Bold))
@@ -140,41 +142,85 @@ namespace ScreenShare.Host.Forms
 
             try
             {
-                // Replace the current frame
-                lock (_frameLock)
-                {
-                    if (_currentFrame != null && _currentFrame != image)
-                    {
-                        _currentFrame.Dispose();
-                    }
-
-                    _currentFrame = image;
-                }
-
-                // Render on UI thread
+                // Handle cross-thread operation
                 if (InvokeRequired)
                 {
-                    BeginInvoke(new Action(() => {
-                        if (!_isDisposed && _renderer != null && _currentFrame != null)
+                    try
+                    {
+                        BeginInvoke(new Action<Bitmap>(UpdateImage), image);
+                        return; // Image will be handled by UI thread
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // Control might be disposed if form is closing
+                        image.Dispose();
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        EnhancedLogger.Instance.Error($"Error invoking image update: {ex.Message}", ex);
+                        image.Dispose();
+                        return;
+                    }
+                }
+
+                // Now on UI thread - replace the current frame with thread safety
+                lock (_frameLock)
+                {
+                    try
+                    {
+                        // First, nullify the renderer's current image
+                        if (_renderer != null)
+                        {
+                            _renderer.ClearFrame();
+                        }
+
+                        // Dispose the old image
+                        if (_currentFrame != null && _currentFrame != image)
+                        {
+                            var oldFrame = _currentFrame;
+                            _currentFrame = null;
+                            oldFrame.Dispose();
+                        }
+
+                        // Set the new image
+                        _currentFrame = image;
+
+                        // Render the new image
+                        if (_renderer != null && _currentFrame != null && !_isDisposed)
                         {
                             _renderer.RenderFrame(_currentFrame);
                         }
-                    }));
-                }
-                else
-                {
-                    if (!_isDisposed && _renderer != null && _currentFrame != null)
+                    }
+                    catch (Exception ex)
                     {
-                        _renderer.RenderFrame(_currentFrame);
+                        EnhancedLogger.Instance.Error($"Error updating remote control image: {ex.Message}", ex);
+
+                        // Cleanup on error
+                        try
+                        {
+                            if (_currentFrame != null && _currentFrame != image)
+                            {
+                                _currentFrame.Dispose();
+                            }
+                            _currentFrame = null;
+
+                            if (image != null)
+                            {
+                                image.Dispose();
+                            }
+                        }
+                        catch { /* Ignore cleanup errors */ }
                     }
                 }
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("Error updating image", ex);
+                EnhancedLogger.Instance.Error("Error updating image", ex);
+                try { image?.Dispose(); } catch { }
             }
         }
-
+        
         private void OnPanelMouseMove(object sender, MouseEventArgs e)
         {
             if (!_isControlling || _currentFrame == null)

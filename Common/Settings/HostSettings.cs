@@ -1,5 +1,4 @@
-﻿// ScreenShare.Common/Settings/HostSettings.cs
-using System;
+﻿using System;
 using System.IO;
 using Newtonsoft.Json;
 

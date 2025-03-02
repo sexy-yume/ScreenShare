@@ -1,29 +1,44 @@
-// ScreenShare.Host/Forms/MainForm.cs
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Drawing;
+using System.Threading;
 using System.Windows.Forms;
 using ScreenShare.Common.Models;
 using ScreenShare.Common.Settings;
-using ScreenShare.Host.Decoder;
-using ScreenShare.Host.Network;
 using ScreenShare.Common.Utils;
-using System.Linq;
+using ScreenShare.Host.Decoder;
+using ScreenShare.Host.Forms;
+using ScreenShare.Host.Network;
+using ScreenShare.Host.Processing;
 
 namespace ScreenShare.Host.Forms
 {
     public partial class MainForm : Form
     {
+        // Settings and main components
         private HostSettings _settings;
         private NetworkServer _networkServer;
+        private FFmpegDecoder _decoder;
+        private FrameProcessingManager _processingManager;
         private System.Windows.Forms.Timer _networkUpdateTimer;
-        private ConcurrentDictionary<int, RemoteControlForm> _remoteControlForms = new ConcurrentDictionary<int, RemoteControlForm>();
-        private ConcurrentDictionary<int, FFmpegDecoder> _decoders = new ConcurrentDictionary<int, FFmpegDecoder>();
-        private ConcurrentDictionary<int, Bitmap> _lastFrames = new ConcurrentDictionary<int, Bitmap>();
-        private List<ClientTile> _clientTiles;
-        private int _tileWidth = 256;
-        private int _tileHeight = 144;
+        private readonly object _syncLock = new object();
+
+        // Client tracking
+        private readonly ConcurrentDictionary<int, ClientTile> _clientTiles = new ConcurrentDictionary<int, ClientTile>();
+        private readonly ConcurrentDictionary<int, RemoteControlForm> _remoteControlForms = new ConcurrentDictionary<int, RemoteControlForm>();
+
+        // Performance monitoring
+        private readonly ConcurrentDictionary<int, ClientPerformanceMetrics> _clientMetrics = new ConcurrentDictionary<int, ClientPerformanceMetrics>();
+        private System.Windows.Forms.Timer _performanceUpdateTimer;
+        private System.Windows.Forms.Timer _uiRefreshTimer;
+        private bool _showDebugInfo = false;
+
+        // UI components for performance display
+        private StatusStrip _statusStrip;
+        private ToolStripStatusLabel _statusLabel;
+        private ToolStripStatusLabel _clientCountLabel;
+        private ToolStripStatusLabel _processingFpsLabel;
+        private ToolStripStatusLabel _memoryUsageLabel;
 
         public MainForm()
         {
@@ -31,143 +46,268 @@ namespace ScreenShare.Host.Forms
 
             try
             {
-                // 설정 로드
+                // Initialize the enhanced logger
+                EnhancedLogger.Instance.SetLogLevels(
+                    EnhancedLogger.LogLevel.Debug,   // Console level - set to Debug for troubleshooting
+                    EnhancedLogger.LogLevel.Debug    // File level
+                );
+
+                EnhancedLogger.Instance.Info("Host MainForm initializing");
+
+                // Initialize UI components
+                InitializeStatusUI();
+
+                // Load settings
                 _settings = HostSettings.Load();
 
-                // 로거 초기화
-                FileLogger.Instance.WriteInfo("호스트 메인 폼 초기화 시작");
+                // Update UI title with server information
+                Text = $"ScreenShare Manager - {_settings.HostIp}:{_settings.HostPort}";
 
-                // 네트워크 서버 초기화
-                _networkServer = new NetworkServer(_settings);
-                _networkServer.ClientConnected += OnClientConnected;
-                _networkServer.ClientDisconnected += OnClientDisconnected;
-                _networkServer.ScreenDataReceived += OnScreenDataReceived;
+                // Initialize client tiles panel
+                tilePanel.AutoScroll = true;
+                tilePanel.Padding = new Padding(5);
 
-                // 타이머 초기화
-                _networkUpdateTimer = new System.Windows.Forms.Timer();
-                _networkUpdateTimer.Interval = 15;
-                _networkUpdateTimer.Tick += (s, e) => _networkServer.Update();
+                FormClosing += (s, e) => Cleanup();
 
-                // 디코더 및 프레임 저장소 초기화
-                _decoders = new ConcurrentDictionary<int, FFmpegDecoder>();
-                _lastFrames = new ConcurrentDictionary<int, Bitmap>();
-                _clientTiles = new List<ClientTile>();
+                // Register keyboard shortcuts
+                KeyPreview = true;
+                KeyDown += OnKeyDown;
 
-                // 타일 그리드 초기화
-                InitializeTileGrid();
+                // Start with buttons in correct state
+                btnStart.Enabled = true;
+                btnStop.Enabled = false;
 
-                FileLogger.Instance.WriteInfo("호스트 메인 폼 초기화 완료");
+                EnhancedLogger.Instance.Info("Host MainForm initialization complete");
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("호스트 메인 폼 초기화 오류", ex);
-                MessageBox.Show($"초기화 오류: {ex.Message}", "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                EnhancedLogger.Instance.Error("Host MainForm initialization error", ex);
+                MessageBox.Show($"Error initializing: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
-        private void InitializeTileGrid()
+        private void InitializeStatusUI()
         {
-            // 기존 타일 제거
-            tilePanel.Controls.Clear();
-            _clientTiles.Clear();
+            // Set up status strip
+            _statusStrip = new StatusStrip();
+            _statusStrip.SizingGrip = false;
 
-            // 타일 생성
-            for (int i = 1; i <= _settings.MaxClients; i++)
-            {
-                var tile = new ClientTile(i);
-                tile.Width = _tileWidth;
-                tile.Height = _tileHeight;
+            // Create status labels
+            _statusLabel = new ToolStripStatusLabel("Ready");
+            _statusLabel.AutoSize = true;
+            _statusLabel.Spring = true;
+            _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
 
-                // 이벤트 처리 수정: DoubleClick 이벤트 사용
-                tile.DoubleClick += OnTileDoubleClick;
+            _clientCountLabel = new ToolStripStatusLabel("Clients: 0");
+            _clientCountLabel.AutoSize = true;
+            _clientCountLabel.BorderSides = ToolStripStatusLabelBorderSides.Left;
+            _clientCountLabel.BorderStyle = Border3DStyle.Etched;
+            _clientCountLabel.Padding = new Padding(5, 0, 5, 0);
 
-                int row = (i - 1) / _settings.TileColumns;
-                int col = (i - 1) % _settings.TileColumns;
+            _processingFpsLabel = new ToolStripStatusLabel("FPS: --");
+            _processingFpsLabel.AutoSize = true;
+            _processingFpsLabel.BorderSides = ToolStripStatusLabelBorderSides.Left;
+            _processingFpsLabel.BorderStyle = Border3DStyle.Etched;
+            _processingFpsLabel.Padding = new Padding(5, 0, 5, 0);
+            _processingFpsLabel.Visible = _showDebugInfo;
 
-                tile.Location = new Point(col * (_tileWidth + 5), row * (_tileHeight + 5));
+            _memoryUsageLabel = new ToolStripStatusLabel("Mem: -- MB");
+            _memoryUsageLabel.AutoSize = true;
+            _memoryUsageLabel.BorderSides = ToolStripStatusLabelBorderSides.Left;
+            _memoryUsageLabel.BorderStyle = Border3DStyle.Etched;
+            _memoryUsageLabel.Padding = new Padding(5, 0, 5, 0);
+            _memoryUsageLabel.Visible = _showDebugInfo;
 
-                tilePanel.Controls.Add(tile);
-                _clientTiles.Add(tile);
+            // Add labels to status strip
+            _statusStrip.Items.AddRange(new ToolStripItem[] {
+                _statusLabel,
+                _clientCountLabel,
+                _processingFpsLabel,
+                _memoryUsageLabel
+            });
 
-                FileLogger.Instance.WriteInfo($"타일 {i} 생성");
-            }
+            // Add status strip to form
+            Controls.Add(_statusStrip);
         }
 
-        private void Cleanup()
+        private void OnKeyDown(object sender, KeyEventArgs e)
         {
-            try
+            // Toggle debug info with Ctrl+D
+            if (e.Control && e.KeyCode == Keys.D)
             {
-                // 원격 제어 폼 정리
-                foreach (var form in _remoteControlForms.Values)
-                {
-                    form.Close();
-                    form.Dispose();
-                }
-                _remoteControlForms.Clear();
+                _showDebugInfo = !_showDebugInfo;
+                _processingFpsLabel.Visible = _showDebugInfo;
+                _memoryUsageLabel.Visible = _showDebugInfo;
 
-                // 디코더 정리
-                foreach (var decoder in _decoders.Values)
+                if (_showDebugInfo)
                 {
-                    decoder.Dispose();
+                    ConsoleHelper.ShowConsoleWindow();
                 }
-                _decoders.Clear();
-
-                // 마지막 프레임 정리
-                foreach (var frame in _lastFrames.Values)
+                else
                 {
-                    frame.Dispose();
+                    ConsoleHelper.HideConsoleWindow();
                 }
-                _lastFrames.Clear();
 
-                // 기타 리소스 정리
-                _networkServer?.Stop();
-                _networkUpdateTimer?.Stop();
+                e.Handled = true;
             }
-            catch (Exception ex)
+
+            // Force GC with Ctrl+G (for debugging memory issues)
+            if (e.Control && e.KeyCode == Keys.G && _showDebugInfo)
             {
-                FileLogger.Instance.WriteError("리소스 정리 중 오류 발생", ex);
+                GC.Collect();
+                EnhancedLogger.Instance.Info("Manual garbage collection triggered");
+                e.Handled = true;
             }
         }
 
         private void OnStartButtonClick(object sender, EventArgs e)
         {
-            if (!_networkServer.IsRunning)
-            {
-                try
-                {
-                    _networkServer.Start();
-                    _networkUpdateTimer.Start();
-
-                    btnStart.Enabled = false;
-                    btnStop.Enabled = true;
-                    logListBox.Items.Add($"서버 시작 - 포트: {_settings.HostPort}");
-                    FileLogger.Instance.WriteInfo($"서버 시작 - 포트: {_settings.HostPort}");
-                }
-                catch (Exception ex)
-                {
-                    FileLogger.Instance.WriteError("서버 시작 오류", ex);
-                    MessageBox.Show($"서버 시작 오류: {ex.Message}", "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-            }
+            StartServer();
         }
 
         private void OnStopButtonClick(object sender, EventArgs e)
         {
-            if (_networkServer.IsRunning)
+            StopServer();
+        }
+
+        private void StartServer()
+        {
+            try
             {
-                _networkServer.Stop();
-                _networkUpdateTimer.Stop();
-
-                btnStart.Enabled = true;
-                btnStop.Enabled = false;
-                logListBox.Items.Add("서버 중지");
-                FileLogger.Instance.WriteInfo("서버 중지");
-
-                // 모든 타일 초기화
-                foreach (var tile in _clientTiles)
+                lock (_syncLock)
                 {
-                    tile.UpdateImage(null);
-                    tile.Connected = false;
+                    // Initialize components
+                    _networkServer = new NetworkServer(_settings);
+                    _decoder = new FFmpegDecoder(useHardwareAcceleration: true, threadCount: 2);
+                    _decoder.SetVerboseLogging(_showDebugInfo);
+
+                    // Configure and start frame processing manager
+                    _processingManager = new FrameProcessingManager(_networkServer, _decoder);
+                    _processingManager.Configure(
+                        dropOutdatedFrames: true,
+                        maxQueueSize: 4,
+                        frameExpirationMs: 1000,
+                        useParallelProcessing: true
+                    );
+
+                    // Subscribe to events
+                    _networkServer.ClientConnected += OnClientConnected;
+                    _networkServer.ClientDisconnected += OnClientDisconnected;
+                    _networkServer.PerformanceUpdated += OnClientPerformanceUpdated;
+                    _processingManager.FrameProcessed += OnFrameProcessed;
+                    _processingManager.MetricsUpdated += OnProcessingMetricsUpdated;
+
+                    // Initialize network timer
+                    _networkUpdateTimer = new System.Windows.Forms.Timer();
+                    _networkUpdateTimer.Interval = 15;
+                    _networkUpdateTimer.Tick += (s, e) => _networkServer.Update();
+                    _networkUpdateTimer.Start();
+
+                    // Initialize performance update timer
+                    _performanceUpdateTimer = new System.Windows.Forms.Timer();
+                    _performanceUpdateTimer.Interval = 1000; // Update once per second
+                    _performanceUpdateTimer.Tick += OnPerformanceUpdateTick;
+                    _performanceUpdateTimer.Start();
+
+                    // Initialize UI refresh timer
+                    _uiRefreshTimer = new System.Windows.Forms.Timer();
+                    _uiRefreshTimer.Interval = 250; // Refresh 4 times per second
+                    _uiRefreshTimer.Tick += (s, e) => ForceRedrawClientTiles();
+                    _uiRefreshTimer.Start();
+
+                    // Start network server
+                    _networkServer.Start();
+
+                    // Update UI
+                    btnStart.Enabled = false;
+                    btnStop.Enabled = true;
+                    _statusLabel.Text = $"Server running on {_settings.HostIp}:{_settings.HostPort}";
+
+                    AddLogMessage($"Server started on {_settings.HostIp}:{_settings.HostPort}");
+                    EnhancedLogger.Instance.Info($"Server started on {_settings.HostIp}:{_settings.HostPort}");
+                }
+            }
+            catch (Exception ex)
+            {
+                EnhancedLogger.Instance.Error("Failed to start server", ex);
+                MessageBox.Show($"Failed to start server: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void StopServer()
+        {
+            try
+            {
+                lock (_syncLock)
+                {
+                    // Stop timers
+                    _networkUpdateTimer?.Stop();
+                    _performanceUpdateTimer?.Stop();
+                    _uiRefreshTimer?.Stop();
+
+                    // Close remote control forms
+                    foreach (var form in _remoteControlForms.Values)
+                    {
+                        try
+                        {
+                            form.Close();
+                            form.Dispose();
+                        }
+                        catch { /* Ignore errors during cleanup */ }
+                    }
+                    _remoteControlForms.Clear();
+
+                    // Clear client tiles
+                    foreach (var tile in _clientTiles.Values)
+                    {
+                        try
+                        {
+                            tilePanel.Controls.Remove(tile);
+                            tile.Dispose();
+                        }
+                        catch { /* Ignore errors during cleanup */ }
+                    }
+                    _clientTiles.Clear();
+
+                    // Dispose components
+                    _processingManager?.Dispose();
+                    _decoder?.Dispose();
+                    _networkServer?.Dispose();
+
+                    // Update UI
+                    btnStart.Enabled = true;
+                    btnStop.Enabled = false;
+                    _statusLabel.Text = "Server stopped";
+                    _clientCountLabel.Text = "Clients: 0";
+
+                    AddLogMessage("Server stopped");
+                    EnhancedLogger.Instance.Info("Server stopped");
+
+                    // Force garbage collection to clean up resources
+                    GC.Collect();
+                }
+            }
+            catch (Exception ex)
+            {
+                EnhancedLogger.Instance.Error("Error stopping server", ex);
+                MessageBox.Show($"Error stopping server: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void ForceRedrawClientTiles()
+        {
+            foreach (var tile in _clientTiles.Values)
+            {
+                try
+                {
+                    if (tile != null && !tile.IsDisposed)
+                    {
+                        tile.ForceRefresh();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    EnhancedLogger.Instance.Error($"Error refreshing tile: {ex.Message}", ex);
                 }
             }
         }
@@ -180,22 +320,26 @@ namespace ScreenShare.Host.Forms
                 return;
             }
 
-            // 로그 추가
-            string message = $"클라이언트 {e.ClientNumber} 연결됨 - {e.ClientInfo.ClientIp}:{e.ClientInfo.ClientPort}";
-            logListBox.Items.Add(message);
-            FileLogger.Instance.WriteInfo(message);
-
-            // 디코더 생성
-            var decoder = new FFmpegDecoder();
-            decoder.FrameDecoded += (s, bitmap) => OnFrameDecoded(e.ClientNumber, bitmap);
-            _decoders[e.ClientNumber] = decoder;
-
-            // 해당 타일 업데이트
-            if (e.ClientNumber > 0 && e.ClientNumber <= _clientTiles.Count)
+            try
             {
-                var tile = _clientTiles[e.ClientNumber - 1];
-                tile.Connected = true;
-                tile.UpdateLabel($"클라이언트 {e.ClientNumber} - 연결됨");
+                // Create a new client tile
+                var clientTile = new ClientTile(e.ClientNumber, e.ClientInfo);
+                clientTile.RemoteControlRequested += OnRemoteControlRequested;
+
+                // Add to panel
+                tilePanel.Controls.Add(clientTile);
+                _clientTiles[e.ClientNumber] = clientTile;
+
+                // Update UI
+                ArrangeTiles();
+                _clientCountLabel.Text = $"Clients: {_clientTiles.Count}";
+
+                AddLogMessage($"Client {e.ClientNumber} connected from {e.ClientInfo.ClientIp}");
+                EnhancedLogger.Instance.Info($"Client {e.ClientNumber} connected from {e.ClientInfo.ClientIp}");
+            }
+            catch (Exception ex)
+            {
+                EnhancedLogger.Instance.Error($"Error handling client connection: {e.ClientNumber}", ex);
             }
         }
 
@@ -207,263 +351,610 @@ namespace ScreenShare.Host.Forms
                 return;
             }
 
-            // 로그 추가
-            string message = $"클라이언트 {e.ClientNumber} 연결 해제";
-            logListBox.Items.Add(message);
-            FileLogger.Instance.WriteInfo(message);
-
-            // 디코더 제거
-            if (_decoders.TryRemove(e.ClientNumber, out var decoder))
+            try
             {
-                decoder.Dispose();
-            }
-
-            // 마지막 프레임 제거
-            if (_lastFrames.TryRemove(e.ClientNumber, out var frame))
-            {
-                frame.Dispose();
-            }
-
-            // 해당 타일 업데이트
-            if (e.ClientNumber > 0 && e.ClientNumber <= _clientTiles.Count)
-            {
-                var tile = _clientTiles[e.ClientNumber - 1];
-                tile.Connected = false;
-                tile.UpdateImage(null);
-                tile.UpdateLabel($"클라이언트 {e.ClientNumber} - 연결 끊김");
-            }
-
-            // 열려있는 원격 제어 창 닫기
-            foreach (Form form in Application.OpenForms)
-            {
-                if (form is RemoteControlForm rcForm && rcForm.ClientNumber == e.ClientNumber)
+                // Remove client tile
+                if (_clientTiles.TryRemove(e.ClientNumber, out var tile))
                 {
-                    rcForm.Close();
-                    break;
+                    tilePanel.Controls.Remove(tile);
+                    tile.Dispose();
                 }
+
+                // Close remote control form if open
+                if (_remoteControlForms.TryRemove(e.ClientNumber, out var form))
+                {
+                    form.Close();
+                    form.Dispose();
+                }
+
+                // Remove client metrics
+                _clientMetrics.TryRemove(e.ClientNumber, out _);
+
+                // Update UI
+                ArrangeTiles();
+                _clientCountLabel.Text = $"Clients: {_clientTiles.Count}";
+
+                AddLogMessage($"Client {e.ClientNumber} disconnected");
+                EnhancedLogger.Instance.Info($"Client {e.ClientNumber} disconnected");
+            }
+            catch (Exception ex)
+            {
+                EnhancedLogger.Instance.Error($"Error handling client disconnection: {e.ClientNumber}", ex);
             }
         }
 
-        private void OnScreenDataReceived(object sender, ScreenDataEventArgs e)
+        private void OnFrameProcessed(object sender, FrameProcessedEventArgs e)
+        {
+            if (e == null || e.Bitmap == null)
+                return;
+
+            try
+            {
+                EnhancedLogger.Instance.Debug($"Frame processed event: client={e.ClientNumber}, size={e.Bitmap.Width}x{e.Bitmap.Height}");
+
+                // Fix 1: Make exact copies of the bitmap for each destination
+                // This is critical - we need separate instances
+
+                // Handle tile update
+                if (_clientTiles.TryGetValue(e.ClientNumber, out var tile))
+                {
+                    try
+                    {
+                        // Create a CLEAN COPY for the tile
+                        Bitmap tileCopy = new Bitmap(e.Bitmap.Width, e.Bitmap.Height);
+                        using (Graphics g = Graphics.FromImage(tileCopy))
+                        {
+                            g.Clear(Color.Black); // Start with a clean slate
+                            g.DrawImage(e.Bitmap, 0, 0, e.Bitmap.Width, e.Bitmap.Height);
+                        }
+
+                        EnhancedLogger.Instance.Debug($"Created clean copy for tile: {e.ClientNumber}");
+
+                        // Send copy to the tile
+                        tile.UpdateImage(tileCopy);
+                    }
+                    catch (Exception ex)
+                    {
+                        EnhancedLogger.Instance.Error($"Error creating bitmap for tile: {ex.Message}", ex);
+                    }
+                }
+
+                // Handle remote control form update
+                if (_remoteControlForms.TryGetValue(e.ClientNumber, out var form))
+                {
+                    try
+                    {
+                        // Create a different copy for the remote control form
+                        Bitmap remoteControlCopy = new Bitmap(e.Bitmap.Width, e.Bitmap.Height);
+                        using (Graphics g = Graphics.FromImage(remoteControlCopy))
+                        {
+                            g.Clear(Color.Black); // Start with a clean slate
+                            g.DrawImage(e.Bitmap, 0, 0, e.Bitmap.Width, e.Bitmap.Height);
+                        }
+
+                        EnhancedLogger.Instance.Debug($"Created clean copy for remote control: {e.ClientNumber}");
+
+                        // Send copy to the remote control form
+                        form.UpdateImage(remoteControlCopy);
+                    }
+                    catch (Exception ex)
+                    {
+                        EnhancedLogger.Instance.Error($"Error creating bitmap for remote control: {ex.Message}", ex);
+                    }
+                }
+
+                // Always dispose the original bitmap since we've made copies
+                e.Bitmap.Dispose();
+            }
+            catch (Exception ex)
+            {
+                EnhancedLogger.Instance.Error($"Error in OnFrameProcessed: {ex.Message}", ex);
+
+                // Clean up on error
+                try { e.Bitmap?.Dispose(); } catch { }
+            }
+        }
+
+        private void OnClientPerformanceUpdated(object sender, PerformanceEventArgs e)
         {
             try
             {
-                int clientNumber = e.ClientNumber;
+                // Store metrics for display
+                _clientMetrics[e.ClientNumber] = e.Metrics;
 
-                // 해당 클라이언트용 디코더 가져오기
-                var decoder = _decoders.GetOrAdd(clientNumber, num => {
-                    var newDecoder = new FFmpegDecoder();
-                    FileLogger.Instance.WriteInfo($"클라이언트 {clientNumber}용 새 디코더 생성");
-                    return newDecoder;
-                });
-
-                // 데이터 디코딩
-                Bitmap decodedFrame = decoder.DecodeFrame(e.ScreenData, e.Width, e.Height);
-
-                if (decodedFrame != null)
+                // Update client tile if on UI thread
+                if (!InvokeRequired && _clientTiles.TryGetValue(e.ClientNumber, out var tile))
                 {
-                    // 원격 제어 폼이 있으면 프레임 전달
-                    if (_remoteControlForms.TryGetValue(clientNumber, out var form))
-                    {
-                        form.UpdateImage(decodedFrame);
-                    }
-                    else
-                    {
-                        // 타일에 축소된 이미지 표시
-                        var clientTile = _clientTiles.FirstOrDefault(tile => tile.ClientNumber == clientNumber);
-                        if (clientTile != null)
-                        {
-                            // 타일 크기에 맞게 이미지 축소
-                            using (Bitmap resizedImage = new Bitmap(decodedFrame, clientTile.Width, clientTile.Height))
-                            {
-                                clientTile.UpdateImage(resizedImage);
-                            }
-                        }
-
-                        // 마지막 프레임 저장 (원격 제어 시작 시 사용)
-                        Bitmap oldFrame;
-                        if (_lastFrames.TryRemove(clientNumber, out oldFrame))
-                        {
-                            oldFrame.Dispose();
-                        }
-                        _lastFrames[clientNumber] = decodedFrame;
-                    }
+                    tile.UpdatePerformance(e.Metrics);
                 }
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("화면 데이터 처리 오류", ex);
+                EnhancedLogger.Instance.Error($"Error updating performance for client {e.ClientNumber}", ex);
             }
         }
 
-        private void OnFrameDecoded(int clientNumber, Bitmap bitmap)
+        private void OnProcessingMetricsUpdated(object sender, ProcessingMetricsEventArgs e)
         {
-            if (InvokeRequired)
+            try
             {
-                Invoke(new Action<int, Bitmap>(OnFrameDecoded), clientNumber, bitmap);
-                return;
-            }
-
-            // 마지막 프레임 업데이트
-            if (_lastFrames.TryGetValue(clientNumber, out var oldFrame))
-            {
-                oldFrame.Dispose();
-            }
-
-            _lastFrames[clientNumber] = bitmap;
-
-            // 해당 타일 업데이트
-            if (clientNumber > 0 && clientNumber <= _clientTiles.Count)
-            {
-                var tile = _clientTiles[clientNumber - 1];
-                tile.UpdateImage(bitmap);
-            }
-
-            // 열려있는 원격 제어 창 업데이트
-            foreach (Form form in Application.OpenForms)
-            {
-                if (form is RemoteControlForm rcForm && rcForm.ClientNumber == clientNumber)
+                if (!InvokeRequired)
                 {
-                    if (!rcForm.IsDisposed)
-                    {
-                        rcForm.UpdateImage(bitmap);
-                    }
-                    break;
+                    _processingFpsLabel.Text = $"FPS: {e.Metrics.ProcessingFps:F1}";
                 }
             }
+            catch { /* Ignore errors in metrics updates */ }
         }
 
-        // 이전 OnTileClick 메서드를 OnTileDoubleClick으로 대체하고 개선
-        private void OnTileDoubleClick(object sender, EventArgs e)
+        private void OnPerformanceUpdateTick(object sender, EventArgs e)
         {
-            if (sender is ClientTile tile)
+            // Update memory usage display
+            if (_showDebugInfo)
             {
-                int clientNumber = tile.ClientNumber;
-                FileLogger.Instance.WriteInfo($"타일 {clientNumber} 더블클릭 - 원격 제어 시작");
+                long memoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
+                _memoryUsageLabel.Text = $"Mem: {memoryMB} MB";
+            }
+        }
 
-                // 이미 열린 원격 제어 창이 있는지 확인
+        private void OnRemoteControlRequested(object sender, int clientNumber)
+        {
+            try
+            {
+                // Check if we already have a remote control form open
                 if (_remoteControlForms.ContainsKey(clientNumber))
                 {
-                    // 이미 열려 있으면 포커스 가져오기
-                    _remoteControlForms[clientNumber].Focus();
+                    // Bring existing form to front
+                    _remoteControlForms[clientNumber].BringToFront();
                     return;
                 }
 
-                // 최근 프레임이 있는지 확인
-                Bitmap initialFrame = null;
-                if (_lastFrames.TryGetValue(clientNumber, out var frame))
+                // Get the client info
+                if (!_clientTiles.TryGetValue(clientNumber, out var tile))
                 {
-                    initialFrame = frame;
+                    return;
                 }
 
-                // 원격 제어 요청 전송
-                if (_networkServer.SendRemoteControlRequest(clientNumber))
+                // Get latest image
+                var latestImage = tile.GetLatestImage();
+                if (latestImage == null)
                 {
-                    // 원격 제어 폼 생성
-                    var remoteForm = new RemoteControlForm(_networkServer, clientNumber, initialFrame);
-                    _remoteControlForms.TryAdd(clientNumber, remoteForm);
-
-                    // 폼 종료 이벤트 처리
-                    remoteForm.FormClosed += (s, args) => {
-                        // 원격 제어 종료 메시지 전송
-                        _networkServer.SendRemoteControlEnd(clientNumber);
-                        RemoteControlForm removedForm;
-                        _remoteControlForms.TryRemove(clientNumber, out removedForm);
-                    };
-
-                    // 원격 제어 창 표시
-                    remoteForm.Show();
-                    remoteForm.Focus();
-                    FileLogger.Instance.WriteInfo($"클라이언트 {clientNumber} 원격 제어 창 열림");
+                    latestImage = new Bitmap(800, 600); // Default size
+                    using (var g = Graphics.FromImage(latestImage))
+                    {
+                        g.Clear(Color.Black);
+                        g.DrawString("Waiting for screen data...",
+                            new Font("Arial", 16), Brushes.White, 10, 10);
+                    }
                 }
-                else
+
+                // Create and show remote control form
+                var form = new RemoteControlForm(_networkServer, clientNumber, latestImage);
+                form.FormClosed += (s, e) => {
+                    // Send remote control end command when form is closed
+                    _networkServer.SendRemoteControlEnd(clientNumber);
+                    _remoteControlForms.TryRemove(clientNumber, out _);
+                };
+
+                _remoteControlForms[clientNumber] = form;
+                form.Show();
+
+                // Send remote control request to client
+                _networkServer.SendRemoteControlRequest(clientNumber);
+
+                AddLogMessage($"Remote control started for client {clientNumber}");
+                EnhancedLogger.Instance.Info($"Remote control started for client {clientNumber}");
+            }
+            catch (Exception ex)
+            {
+                EnhancedLogger.Instance.Error($"Error starting remote control for client {clientNumber}", ex);
+                MessageBox.Show($"Error starting remote control: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void ArrangeTiles()
+        {
+            int tileWidth = 320;
+            int tileHeight = 240;
+            int margin = 10;
+            int maxColumns = Math.Max(1, _settings.TileColumns);
+
+            int column = 0;
+            int row = 0;
+
+            foreach (var tile in _clientTiles.Values)
+            {
+                tile.Location = new Point(
+                    column * (tileWidth + margin) + margin,
+                    row * (tileHeight + margin) + margin);
+                tile.Size = new Size(tileWidth, tileHeight);
+
+                column++;
+                if (column >= maxColumns)
                 {
-                    FileLogger.Instance.WriteError($"클라이언트 {clientNumber}에 원격 제어 요청 실패");
-                    MessageBox.Show($"클라이언트 {clientNumber}에 원격 제어 요청을 보낼 수 없습니다.", "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    column = 0;
+                    row++;
                 }
             }
         }
 
-        protected override void OnFormClosing(FormClosingEventArgs e)
+        private void AddLogMessage(string message)
         {
-            base.OnFormClosing(e);
-            Cleanup();
+            if (InvokeRequired)
+            {
+                Invoke(new Action<string>(AddLogMessage), message);
+                return;
+            }
+
+            // Add timestamp
+            string logEntry = $"[{DateTime.Now:HH:mm:ss}] {message}";
+
+            // Add to log list box
+            logListBox.Items.Add(logEntry);
+
+            // Auto-scroll to bottom
+            logListBox.SelectedIndex = logListBox.Items.Count - 1;
+            logListBox.ClearSelected();
+
+            // Limit entries
+            while (logListBox.Items.Count > 1000)
+            {
+                logListBox.Items.RemoveAt(0);
+            }
+        }
+
+        private void Cleanup()
+        {
+            StopServer();
+            EnhancedLogger.Instance.Info("Main form closed");
+            EnhancedLogger.Instance.Dispose();
         }
     }
 
-    // 클라이언트 타일 컨트롤
+    /// <summary>
+    /// Client tile for displaying client screen and status
+    /// </summary>
     public class ClientTile : Panel
     {
+        private readonly int _clientNumber;
+        private readonly ClientInfo _clientInfo;
         private PictureBox _pictureBox;
-        private Label _label;
+        private Label _infoLabel;
+        private Label _performanceLabel;
+        private Button _remoteControlButton;
+        private Bitmap _currentImage;
+        private readonly object _imageLock = new object();
+        private volatile bool _updatingImage = false;
 
-        public int ClientNumber { get; }
-        public bool Connected { get; set; }
+        public event EventHandler<int> RemoteControlRequested;
 
-        public ClientTile(int clientNumber)
+        public ClientTile(int clientNumber, ClientInfo clientInfo)
         {
-            ClientNumber = clientNumber;
-            Connected = false;
-            BorderStyle = BorderStyle.FixedSingle;
+            _clientNumber = clientNumber;
+            _clientInfo = clientInfo;
 
+            InitializeComponents();
+        }
+
+        private void InitializeComponents()
+        {
+            // Configure panel
+            BorderStyle = BorderStyle.FixedSingle;
+            Padding = new Padding(2);
+
+            // Create picture box
             _pictureBox = new PictureBox
             {
                 Dock = DockStyle.Fill,
-                SizeMode = PictureBoxSizeMode.Zoom
+                SizeMode = PictureBoxSizeMode.Zoom,
+                BackColor = Color.Black
             };
 
-            _label = new Label
+            // Create info label
+            _infoLabel = new Label
             {
                 Dock = DockStyle.Bottom,
-                TextAlign = ContentAlignment.MiddleCenter,
+                TextAlign = ContentAlignment.MiddleLeft,
+                BackColor = Color.FromArgb(64, 64, 64),
+                ForeColor = Color.White,
                 Height = 20,
-                Text = $"클라이언트 {clientNumber} - 대기중"
+                Text = $"Client {_clientNumber} - {_clientInfo.ClientIp}"
             };
 
-            _pictureBox.DoubleClick += (s, e) => this.OnDoubleClick(e);
-            _label.DoubleClick += (s, e) => this.OnDoubleClick(e);
+            // Create performance label
+            _performanceLabel = new Label
+            {
+                Dock = DockStyle.Bottom,
+                TextAlign = ContentAlignment.MiddleRight,
+                BackColor = Color.FromArgb(64, 64, 64),
+                ForeColor = Color.LightGreen,
+                Height = 20,
+                Text = "Waiting for data...",
+                Visible = false
+            };
 
+            // Create remote control button
+            _remoteControlButton = new Button
+            {
+                Dock = DockStyle.None,
+                Text = "Control",
+                Size = new Size(60, 22),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Location = new Point(Width - 65, 5)
+            };
+            _remoteControlButton.Click += (s, e) => RemoteControlRequested?.Invoke(this, _clientNumber);
+
+            // Add controls
             Controls.Add(_pictureBox);
-            Controls.Add(_label);
+            Controls.Add(_infoLabel);
+            Controls.Add(_performanceLabel);
+            Controls.Add(_remoteControlButton);
+
+            // Event handlers
+            Resize += (s, e) => {
+                _remoteControlButton.Location = new Point(Width - 65, 5);
+            };
+
+            // Double click to start remote control
+            _pictureBox.DoubleClick += (s, e) => RemoteControlRequested?.Invoke(this, _clientNumber);
         }
-
-
 
         public void UpdateImage(Bitmap image)
         {
-            if (this.IsDisposed || _pictureBox.IsDisposed)
+            if (image == null)
                 return;
 
-            if (InvokeRequired)
+            if (_updatingImage)
             {
-                BeginInvoke(new Action<Bitmap>(UpdateImage), image);
+                // Already in the middle of an update, dispose this bitmap and exit
+                image.Dispose();
                 return;
             }
 
             try
             {
-                if (_pictureBox.Image != null)
-                {
-                    var oldImage = _pictureBox.Image;
-                    _pictureBox.Image = null;
-                    oldImage.Dispose();
-                }
+                _updatingImage = true;
 
-                if (image != null)
+                // Handle cross-thread operation
+                if (InvokeRequired)
                 {
-                    _pictureBox.Image = new Bitmap(image);
+                    try
+                    {
+                        // Use Invoke (not BeginInvoke) to ensure synchronous execution
+                        Invoke(new Action<Bitmap>(innerImage =>
+                        {
+                            try
+                            {
+                                // On UI thread now, update directly
+                                EnhancedLogger.Instance.Debug($"UI thread image update: Client {_clientNumber}, size={innerImage.Width}x{innerImage.Height}");
+                                UpdateImageDirect(innerImage);
+                            }
+                            catch (Exception ex)
+                            {
+                                EnhancedLogger.Instance.Error($"Error in UI thread image update: {ex.Message}", ex);
+                                innerImage.Dispose();
+                            }
+                        }), image);
+
+                        return;
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // Control might be disposed if form is closing
+                        image.Dispose();
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        EnhancedLogger.Instance.Error($"Error invoking image update: {ex.Message}", ex);
+                        image.Dispose();
+                        return;
+                    }
+                }
+                else
+                {
+                    // Already on UI thread
+                    UpdateImageDirect(image);
                 }
             }
             catch (Exception ex)
             {
-                FileLogger.Instance.WriteError("원격 제어 화면 업데이트 오류", ex);
+                EnhancedLogger.Instance.Error($"Error in UpdateImage: {ex.Message}", ex);
+                try { image?.Dispose(); } catch { }
+            }
+            finally
+            {
+                _updatingImage = false;
             }
         }
 
-
-        public void UpdateLabel(string text)
+        // Direct update method (always called on UI thread)
+        private void UpdateImageDirect(Bitmap image)
         {
-            _label.Text = text;
+            lock (_imageLock)
+            {
+                try
+                {
+                    // Store a reference to the old image for later disposal
+                    var oldImage = _currentImage;
+
+                    // Store the new image first
+                    _currentImage = image;
+
+                    // Update PictureBox on UI thread
+                    if (_pictureBox != null && !IsDisposed && !_pictureBox.IsDisposed)
+                    {
+                        // Set new image first
+                        _pictureBox.Image = _currentImage;
+                        EnhancedLogger.Instance.Debug($"PictureBox image set for client {_clientNumber}, size={image.Width}x{image.Height}");
+
+                        // Update client info dimensions if needed
+                        if (_clientInfo != null &&
+                            (_clientInfo.ScreenWidth != image.Width || _clientInfo.ScreenHeight != image.Height))
+                        {
+                            _clientInfo.ScreenWidth = image.Width;
+                            _clientInfo.ScreenHeight = image.Height;
+                            if (_infoLabel != null && !_infoLabel.IsDisposed)
+                            {
+                                _infoLabel.Text = $"Client {_clientNumber} - {_clientInfo.ClientIp} - {_clientInfo.ScreenWidth}x{_clientInfo.ScreenHeight}";
+                            }
+                        }
+
+                        // Force redraw after setting image
+                        _pictureBox.Refresh();
+                        this.Refresh();
+
+                        // Now dispose the old image AFTER setting the new one
+                        if (oldImage != null && oldImage != image)
+                        {
+                            try
+                            {
+                                oldImage.Dispose();
+                            }
+                            catch (Exception ex)
+                            {
+                                EnhancedLogger.Instance.Error($"Error disposing old image: {ex.Message}", ex);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        EnhancedLogger.Instance.Warning($"PictureBox unavailable for client {_clientNumber}");
+                        // Dispose the image if we can't use it
+                        image.Dispose();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    EnhancedLogger.Instance.Error($"Error in UpdateImageDirect: {ex.Message}", ex);
+                    try { image?.Dispose(); } catch { }
+                }
+            }
+        }
+
+        public void UpdatePerformance(ClientPerformanceMetrics metrics)
+        {
+            if (metrics == null)
+                return;
+
+            try
+            {
+                if (InvokeRequired)
+                {
+                    try
+                    {
+                        BeginInvoke(new Action<ClientPerformanceMetrics>(UpdatePerformance), metrics);
+                    }
+                    catch
+                    {
+                        // Ignore invoke errors
+                    }
+                    return;
+                }
+
+                _performanceLabel.Visible = true;
+                _performanceLabel.Text = $"{metrics.AverageFps:F1} FPS, {metrics.AverageBitrateMbps:F1} Mbps";
+
+                // Update color based on performance
+                if (metrics.AverageFps < 10)
+                {
+                    _performanceLabel.ForeColor = Color.Red;
+                }
+                else if (metrics.AverageFps < 20)
+                {
+                    _performanceLabel.ForeColor = Color.Yellow;
+                }
+                else
+                {
+                    _performanceLabel.ForeColor = Color.LightGreen;
+                }
+            }
+            catch
+            {
+                // Ignore errors in performance updates
+            }
+        }
+
+        public Bitmap GetLatestImage()
+        {
+            lock (_imageLock)
+            {
+                if (_currentImage == null)
+                    return null;
+
+                // Create a copy of the current image
+                try
+                {
+                    return new Bitmap(_currentImage);
+                }
+                catch (Exception ex)
+                {
+                    EnhancedLogger.Instance.Error($"Error copying image: {ex.Message}", ex);
+                    return null;
+                }
+            }
+        }
+
+        public void ForceRefresh()
+        {
+            if (IsDisposed || _pictureBox == null || _pictureBox.IsDisposed)
+                return;
+
+            try
+            {
+                // Force UI update
+                _pictureBox.Invalidate();
+                _pictureBox.Update();
+            }
+            catch { /* Ignore errors during refresh */ }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+
+            // Add extra verification during painting to ensure image is visible
+            try
+            {
+                if (_pictureBox != null && _pictureBox.Image == null && _currentImage != null)
+                {
+                    EnhancedLogger.Instance.Debug($"Detected missing image in PictureBox during paint for client {_clientNumber} - restoring");
+                    _pictureBox.Image = _currentImage;
+                    _pictureBox.Refresh();
+                }
+            }
+            catch (Exception ex)
+            {
+                EnhancedLogger.Instance.Error($"Error during paint: {ex.Message}", ex);
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                lock (_imageLock)
+                {
+                    try
+                    {
+                        if (_pictureBox != null)
+                        {
+                            _pictureBox.Image = null;
+                        }
+
+                        if (_currentImage != null)
+                        {
+                            _currentImage.Dispose();
+                            _currentImage = null;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        EnhancedLogger.Instance.Error($"Error disposing client tile: {ex.Message}", ex);
+                    }
+                }
+            }
+
+            base.Dispose(disposing);
         }
     }
 }
