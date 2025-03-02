@@ -17,6 +17,14 @@ namespace ScreenShare.Host.Processing
     /// Manages asynchronous frame processing to ensure UI responsiveness and
     /// prevent frame processing bottlenecks with improved GOP handling.
     /// </summary>
+    /// 
+    public class ProcessingTask
+    {
+        public long FrameId { get; set; }
+        public long StartTime { get; set; }
+        public DateTime EnqueueTime { get; set; } = DateTime.UtcNow;
+    }
+
     public class FrameProcessingManager : IDisposable
     {
         // Components
@@ -30,6 +38,9 @@ namespace ScreenShare.Host.Processing
         private readonly ConcurrentDictionary<int, Stopwatch> _clientProcessingTimers;
         private readonly ManualResetEvent _shutdownEvent = new ManualResetEvent(false);
         private readonly ConcurrentDictionary<int, Bitmap> _lastSuccessfulFrameByClient;
+        private readonly System.Threading.Timer _cleanupTimer;
+        private readonly ConcurrentDictionary<int, ConcurrentQueue<ProcessingTask>> _processingQueues =
+    new ConcurrentDictionary<int, ConcurrentQueue<ProcessingTask>>();
 
         // Configuration settings
         private bool _dropOutdatedFrames = true;
@@ -71,17 +82,146 @@ namespace ScreenShare.Host.Processing
             _clientProcessingTimers = new ConcurrentDictionary<int, Stopwatch>();
             _lastSuccessfulFrameByClient = new ConcurrentDictionary<int, Bitmap>();
 
-            // 프레임 통계 로거 초기화
             _frameStats = new FrameStatisticsLogger("Processing");
 
-            // Subscribe to network events
             _networkServer.ScreenDataReceived += OnScreenDataReceived;
 
             _uptimeTimer.Start();
 
+            _cleanupTimer = new System.Threading.Timer(CleanupOutdatedFrames, null, 500, 500);
+
             EnhancedLogger.Instance.Info("Frame processing manager initialized with improved GOP management");
         }
 
+        private void CleanupOutdatedFrames(object state)
+        {
+            try
+            {
+                DateTime now = DateTime.UtcNow;
+
+                foreach (var clientEntry in _gopStateByClient)
+                {
+                    int clientId = clientEntry.Key;
+                    var gopMap = clientEntry.Value;
+
+                    foreach (var gopEntry in gopMap.ToList())
+                    {
+                        long keyFrameId = gopEntry.Key;
+                        var gop = gopEntry.Value;
+
+                        if ((now - gop.StartTime) > _frameExpirationTime * 2)
+                        {
+                            if (gopMap.TryRemove(keyFrameId, out var removedGop))
+                            {
+                                EnhancedLogger.Instance.Info($"오래된 GOP {keyFrameId} 제거 (클라이언트 {clientId})");
+
+                                int removedFrames = removedGop.Frames.Count;
+                                Interlocked.Add(ref _totalFramesDropped, removedFrames);
+
+                                removedGop.Frames.Clear();
+                            }
+                            continue;
+                        }
+
+                        var outdatedFrames = gop.Frames
+                            .Where(f => !f.Value.IsProcessed && (now - f.Value.ReceivedTime) > _frameExpirationTime)
+                            .Select(f => f.Key)
+                            .ToList();
+
+                        foreach (var frameId in outdatedFrames)
+                        {
+                            if (gop.Frames.TryRemove(frameId, out var frame))
+                            {
+                                EnhancedLogger.Instance.Debug($"오래된 프레임 {frameId} 제거 (클라이언트 {clientId})");
+                                Interlocked.Increment(ref _totalFramesDropped);
+                                _frameStats.LogFrameDropped(clientId, frameId, frame.IsKeyFrame, "타임아웃 정리");
+                            }
+                        }
+
+                        if (gop.Frames.Count == 0)
+                        {
+                            gopMap.TryRemove(keyFrameId, out _);
+                        }
+                    }
+                }
+
+                foreach (var queueEntry in _processingQueues)
+                {
+                    int clientId = queueEntry.Key;
+                    var queue = queueEntry.Value;
+
+                    int originalCount = queue.Count;
+                    var tempQueue = new ConcurrentQueue<ProcessingTask>();
+
+                    while (queue.TryDequeue(out var task))
+                    {
+                        long elapsedTicks = Stopwatch.GetTimestamp() - task.StartTime;
+                        double elapsedMs = elapsedTicks * 1000.0 / Stopwatch.Frequency;
+
+                        if (elapsedMs < _frameExpirationTime.TotalMilliseconds)
+                        {
+                            tempQueue.Enqueue(task);
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref _totalFramesDropped);
+                        }
+                    }
+
+                    while (tempQueue.TryDequeue(out var task))
+                    {
+                        queue.Enqueue(task);
+                    }
+
+                    int newCount = queue.Count;
+                    if (originalCount - newCount > 5)
+                    {
+                        EnhancedLogger.Instance.Info($"클라이언트 {clientId} 큐에서 {originalCount - newCount}개의 오래된 작업 정리");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                EnhancedLogger.Instance.Error($"프레임 정리 중 오류: {ex.Message}", ex);
+            }
+        }
+        private void AddToProcessingQueue(int clientNumber, long frameId)
+        {
+            var queue = _processingQueues.GetOrAdd(clientNumber, _ => new ConcurrentQueue<ProcessingTask>());
+
+            var task = new ProcessingTask
+            {
+                FrameId = frameId,
+                StartTime = Stopwatch.GetTimestamp(),
+                EnqueueTime = DateTime.UtcNow
+            };
+
+            queue.Enqueue(task);
+
+            // 큐 크기 제한
+            while (queue.Count > _maxQueueSizePerClient * 2)
+            {
+                if (queue.TryDequeue(out _))
+                {
+                    EnhancedLogger.Instance.Warning($"큐 오버플로우로 인해 클라이언트 {clientNumber}의 작업 제거");
+                    Interlocked.Increment(ref _totalFramesDropped);
+                }
+            }
+        }
+
+        // 처리 완료 메서드 (NetworkServer와 연결)
+        private void CompleteProcessing(int clientNumber, long frameId, TimeSpan processingTime)
+        {
+            try
+            {
+                // 네트워크 서버에 처리 완료 알림
+                _networkServer.EndFrameProcessing(clientNumber, frameId);
+            }
+            catch (Exception ex)
+            {
+                EnhancedLogger.Instance.Error($"처리 완료 알림 오류: {ex.Message}", ex);
+            }
+        }
         /// <summary>
         /// Configure frame processing options
         /// </summary>
@@ -118,11 +258,9 @@ namespace ScreenShare.Host.Processing
 
             try
             {
-                // 클라이언트에 대한 GOP 상태 맵 가져오기
                 var gopStateMap = _gopStateByClient.GetOrAdd(e.ClientNumber,
                     _ => new ConcurrentDictionary<long, GopState>());
 
-                // 프레임 데이터 생성
                 var frameData = new FrameData
                 {
                     ClientNumber = e.ClientNumber,
@@ -134,12 +272,10 @@ namespace ScreenShare.Host.Processing
                     IsKeyFrame = e.IsKeyFrame
                 };
 
-                // 키프레임인 경우 새 GOP 시작
                 if (e.IsKeyFrame)
                 {
                     EnhancedLogger.Instance.Debug($"클라이언트 {e.ClientNumber}의 키프레임 수신, frameId={e.FrameId}, 크기={e.ScreenData.Length}");
 
-                    // 새 GOP 상태 생성
                     var gopState = new GopState
                     {
                         KeyFrameId = e.FrameId,
@@ -147,26 +283,20 @@ namespace ScreenShare.Host.Processing
                         IsComplete = false
                     };
 
-                    // 키프레임 추가
-                    gopState.Frames[e.FrameId] = frameData;
-
-                    // GOP 맵에 추가
+                    gopState.AddFrame(frameData);
                     gopStateMap[e.FrameId] = gopState;
 
-                    // 최대 GOP 수 유지 (가장 오래된 것부터 제거)
                     CleanupOldGops(gopStateMap, e.FrameId);
 
                     _frameStats.LogFrameReceived(e.ClientNumber, e.FrameId, true, e.ScreenData.Length);
                 }
                 else
                 {
-                    // 이 프레임이 속한 GOP 찾기 (가장 최근 키프레임)
                     long keyFrameId = FindOwnerKeyFrameId(gopStateMap, e.FrameId);
 
                     if (keyFrameId > 0 && gopStateMap.TryGetValue(keyFrameId, out var gopState))
                     {
-                        // 현재 GOP에 중간 프레임 추가
-                        gopState.Frames[e.FrameId] = frameData;
+                        gopState.AddFrame(frameData);
                         frameData.LastKeyframeId = keyFrameId;
 
                         EnhancedLogger.Instance.Debug(
@@ -177,25 +307,20 @@ namespace ScreenShare.Host.Processing
                     }
                     else
                     {
-                        // 소속된 GOP를 찾을 수 없는 경우 (키프레임 누락)
                         EnhancedLogger.Instance.Warning(
                             $"클라이언트 {e.ClientNumber}의 프레임 {e.FrameId}에 대한 GOP를 찾을 수 없음 - 키프레임 요청");
 
-                        // 키프레임 요청
                         RequestKeyframe(e.ClientNumber, "GOP 대응 없음");
 
                         _frameStats.LogFrameDropped(e.ClientNumber, e.FrameId, false, "GOP 없음");
                         Interlocked.Increment(ref _totalFramesDropped);
 
-                        // 이 프레임은 처리하지 않고 종료
                         return;
                     }
                 }
 
-                // 마지막 프레임 시간 업데이트
                 _lastFrameTimeByClient[e.ClientNumber] = DateTime.UtcNow;
 
-                // 처리 시작
                 ProcessNextFrame(e.ClientNumber);
             }
             catch (Exception ex)
@@ -209,11 +334,27 @@ namespace ScreenShare.Host.Processing
         /// </summary>
         private long FindOwnerKeyFrameId(ConcurrentDictionary<long, GopState> gopStateMap, long frameId)
         {
-            // 프레임 ID보다 작거나 같은 가장 큰 키프레임 ID를 찾습니다
-            return gopStateMap.Keys
-                .Where(keyFrameId => keyFrameId < frameId)
-                .OrderByDescending(keyFrameId => keyFrameId)
-                .FirstOrDefault();
+            // 이 프레임이 이미 GOP에 등록되어 있는지 확인
+            foreach (var gopEntry in gopStateMap)
+            {
+                if (gopEntry.Value.Frames.ContainsKey(frameId))
+                {
+                    return gopEntry.Key;
+                }
+            }
+
+            // 찾지 못한 경우 프레임 ID보다 작은 가장 큰 키프레임 ID 찾기
+            long bestKeyFrameId = 0;
+
+            foreach (var keyFrameId in gopStateMap.Keys)
+            {
+                if (keyFrameId < frameId && keyFrameId > bestKeyFrameId)
+                {
+                    bestKeyFrameId = keyFrameId;
+                }
+            }
+
+            return bestKeyFrameId;
         }
 
         /// <summary>
@@ -369,16 +510,57 @@ namespace ScreenShare.Host.Processing
         {
             try
             {
-                // 가장 최근 GOP부터 찾기
+                int totalPendingFrames = 0;
+
+                foreach (var gop in gopStateMap.Values)
+                {
+                    totalPendingFrames += gop.Frames.Count(f => !f.Value.IsProcessed);
+                }
+
+                bool highPressure = totalPendingFrames > _maxQueueSizePerClient * 2;
+
+                if (highPressure)
+                {
+                    EnhancedLogger.Instance.Info($"높은 처리 압박 모드 (대기 프레임 {totalPendingFrames}개) - 최신 컨텐츠 우선 처리");
+
+                    foreach (var gopId in gopStateMap.Keys.OrderByDescending(k => k))
+                    {
+                        if (gopStateMap.TryGetValue(gopId, out var gopState))
+                        {
+                            var keyFrame = gopState.Frames.Values
+                                .FirstOrDefault(f => f.IsKeyFrame && !f.IsProcessed);
+
+                            if (keyFrame != null)
+                            {
+                                return keyFrame;
+                            }
+
+                            bool keyFrameProcessed = gopState.Frames.Any(kv => kv.Value.IsKeyFrame && kv.Value.IsProcessed);
+
+                            if (keyFrameProcessed)
+                            {
+                                var newestFrame = gopState.Frames
+                                    .Where(kv => !kv.Value.IsProcessed)
+                                    .OrderByDescending(kv => kv.Key)
+                                    .Select(kv => kv.Value)
+                                    .FirstOrDefault();
+
+                                if (newestFrame != null)
+                                {
+                                    return newestFrame;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 foreach (var gopId in gopStateMap.Keys.OrderByDescending(k => k))
                 {
                     if (gopStateMap.TryGetValue(gopId, out var gopState))
                     {
-                        // 이 GOP가 완료되었으면 다음 GOP로
                         if (gopState.IsComplete)
                             continue;
 
-                        // 이 GOP에서 처리되지 않은 가장 오래된 프레임 찾기
                         var unprocessedFrames = gopState.Frames
                             .Where(kv => !kv.Value.IsProcessed)
                             .OrderBy(kv => kv.Key)
@@ -387,38 +569,31 @@ namespace ScreenShare.Host.Processing
 
                         if (unprocessedFrames.Count > 0)
                         {
-                            // 먼저 키프레임 처리
                             var keyFrame = unprocessedFrames.FirstOrDefault(f => f.IsKeyFrame);
                             if (keyFrame != null)
                                 return keyFrame;
 
-                            // 키프레임이 처리되었는지 확인
                             bool keyFrameProcessed = gopState.Frames
                                 .Any(kv => kv.Value.IsKeyFrame && kv.Value.IsProcessed);
 
-                            // 키프레임이 처리되었으면 다음 순차 프레임 반환
                             if (keyFrameProcessed)
                             {
                                 return unprocessedFrames[0];
                             }
-                            // 키프레임이 없으면 이 GOP에 문제가 있음, 다음 GOP로
                             else if (!gopState.Frames.Any(kv => kv.Value.IsKeyFrame))
                             {
                                 EnhancedLogger.Instance.Warning($"키프레임 없는 GOP: 클라이언트={clientNumber}, GOP={gopId}");
-                                // 이 GOP를 완료 표시하고 다음으로
                                 gopState.IsComplete = true;
                                 continue;
                             }
                         }
                         else
                         {
-                            // 이 GOP의 모든 프레임이 처리됨
                             gopState.IsComplete = true;
                         }
                     }
                 }
 
-                // 처리할 프레임을 찾지 못함
                 return null;
             }
             catch (Exception ex)
@@ -441,7 +616,6 @@ namespace ScreenShare.Host.Processing
 
             try
             {
-                // 만료된 프레임 확인
                 if (_dropOutdatedFrames && (DateTime.UtcNow - frame.ReceivedTime) > _frameExpirationTime)
                 {
                     EnhancedLogger.Instance.Debug(
@@ -451,18 +625,15 @@ namespace ScreenShare.Host.Processing
                     Interlocked.Increment(ref _totalFramesDropped);
                     _frameStats.LogFrameDropped(clientNumber, frame.FrameId, frame.IsKeyFrame, "만료됨");
 
-                    // 프레임을 처리된 것으로 표시
                     frame.IsProcessed = true;
                     return;
                 }
 
-                // 처리 시간 추적
                 timer.Restart();
 
-                // 프레임 디코딩
-                _networkServer.BeginFrameProcessing(clientNumber, frame.FrameId);
+                // 큐에 추가 (자체 관리 큐 사용)
+                AddToProcessingQueue(clientNumber, frame.FrameId);
 
-                // 로깅
                 if (frame.IsKeyFrame)
                 {
                     EnhancedLogger.Instance.Info(
@@ -479,24 +650,19 @@ namespace ScreenShare.Host.Processing
 
                 if (decodedFrame != null)
                 {
-                    // 디코딩 성공
                     EnhancedLogger.Instance.Debug(
                         $"클라이언트 {clientNumber}의 프레임 {frame.FrameId} 디코딩 성공");
 
-                    // 오류 카운터 초기화
                     _decodingErrorCounters[clientNumber] = 0;
                     _consecutiveErrorCounters[clientNumber] = 0;
 
-                    // 마지막 성공 프레임 저장
                     SetLastSuccessfulFrame(clientNumber, decodedFrame);
 
-                    // 디코딩 성공 통계 기록
                     timer.Stop();
                     _frameStats.LogDecodingSuccess(clientNumber, frame.FrameId, frame.IsKeyFrame, timer.Elapsed.TotalMilliseconds);
 
                     Interlocked.Increment(ref _totalFramesProcessed);
 
-                    // 알림
                     FrameProcessed?.Invoke(this, new FrameProcessedEventArgs
                     {
                         ClientNumber = clientNumber,
@@ -508,25 +674,20 @@ namespace ScreenShare.Host.Processing
                 }
                 else
                 {
-                    // 디코딩 실패
                     EnhancedLogger.Instance.Warning(
                         $"클라이언트 {clientNumber}의 프레임 {frame.FrameId} 디코딩 실패");
 
-                    // 오류 카운터 증가
                     int errorCount = _decodingErrorCounters.AddOrUpdate(clientNumber, 1, (k, v) => v + 1);
                     int consecutiveErrors = _consecutiveErrorCounters.AddOrUpdate(clientNumber, 1, (k, v) => v + 1);
 
-                    // 디코딩 실패 통계 기록
                     _frameStats.LogDecodingFailure(clientNumber, frame.FrameId, frame.IsKeyFrame);
 
-                    // 키프레임이 실패한 경우
                     if (frame.IsKeyFrame)
                     {
                         EnhancedLogger.Instance.Warning(
                             $"클라이언트 {clientNumber}의 키프레임 {frame.FrameId} 디코딩 실패 - 새 키프레임 요청");
                         RequestKeyframe(clientNumber, "키프레임 디코딩 실패");
                     }
-                    // 연속 실패가 너무 많음
                     else if (consecutiveErrors >= _maxConsecutiveErrorsBeforeReset)
                     {
                         EnhancedLogger.Instance.Warning(
@@ -534,7 +695,6 @@ namespace ScreenShare.Host.Processing
                         RequestKeyframe(clientNumber, $"연속 {consecutiveErrors}회 디코딩 실패");
                         _consecutiveErrorCounters[clientNumber] = 0;
                     }
-                    // 누적 실패가 너무 많음
                     else if (errorCount >= _maxDecodeErrorsBeforeReset)
                     {
                         EnhancedLogger.Instance.Warning(
@@ -543,24 +703,28 @@ namespace ScreenShare.Host.Processing
                         _decodingErrorCounters[clientNumber] = 0;
                     }
 
-                    // 마지막 성공 프레임 사용
                     if (_lastSuccessfulFrameByClient.TryGetValue(clientNumber, out var lastFrame) && lastFrame != null)
                     {
-                        EnhancedLogger.Instance.Debug(
-                            $"클라이언트 {clientNumber}의 마지막 성공 프레임 사용");
-
-                        // 이전 성공 프레임의 복사본 만들기
-                        Bitmap lastFrameCopy = new Bitmap(lastFrame);
-
-                        // 알림
-                        FrameProcessed?.Invoke(this, new FrameProcessedEventArgs
+                        try
                         {
-                            ClientNumber = clientNumber,
-                            Bitmap = lastFrameCopy,
-                            FrameId = frame.FrameId,
-                            ProcessingTime = timer.Elapsed,
-                            IsKeyFrame = false
-                        });
+                            EnhancedLogger.Instance.Debug(
+                                $"클라이언트 {clientNumber}의 마지막 성공 프레임 사용");
+
+                            Bitmap lastFrameCopy = new Bitmap(lastFrame);
+
+                            FrameProcessed?.Invoke(this, new FrameProcessedEventArgs
+                            {
+                                ClientNumber = clientNumber,
+                                Bitmap = lastFrameCopy,
+                                FrameId = frame.FrameId,
+                                ProcessingTime = timer.Elapsed,
+                                IsKeyFrame = false
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            EnhancedLogger.Instance.Error($"마지막 프레임 복사 중 오류: {ex.Message}", ex);
+                        }
                     }
                 }
             }
@@ -574,16 +738,14 @@ namespace ScreenShare.Host.Processing
             }
             finally
             {
-                // 프레임을 처리된 것으로 표시
                 frame.IsProcessed = true;
 
-                // 처리 완료 및 확인 전송
                 long endTicks = Stopwatch.GetTimestamp();
                 long frameTicks = endTicks - startTicks;
                 Interlocked.Add(ref _totalProcessingTime, frameTicks);
 
                 timer.Stop();
-                _networkServer.EndFrameProcessing(clientNumber, frame.FrameId);
+                CompleteProcessing(clientNumber, frame.FrameId, timer.Elapsed);
             }
         }
 
@@ -664,10 +826,10 @@ namespace ScreenShare.Host.Processing
 
         public void Dispose()
         {
+            _cleanupTimer?.Dispose();
             _shutdownEvent.Set();
             _networkServer.ScreenDataReceived -= OnScreenDataReceived;
 
-            // 리소스 정리
             foreach (var client in _gopStateByClient)
             {
                 foreach (var gop in client.Value)
@@ -681,7 +843,6 @@ namespace ScreenShare.Host.Processing
             _lastFrameTimeByClient.Clear();
             _clientProcessingTimers.Clear();
 
-            // 마지막 성공 프레임 정리
             foreach (var frame in _lastSuccessfulFrameByClient.Values)
             {
                 try
@@ -692,7 +853,6 @@ namespace ScreenShare.Host.Processing
             }
             _lastSuccessfulFrameByClient.Clear();
 
-            // 통계 로거 정리
             _frameStats?.Dispose();
 
             _shutdownEvent.Dispose();
@@ -706,17 +866,50 @@ namespace ScreenShare.Host.Processing
     /// </summary>
     public class GopState
     {
-        // 키프레임 ID
+        // GOP 정보
         public long KeyFrameId { get; set; }
-
-        // GOP 시작 시간
         public DateTime StartTime { get; set; }
-
-        // GOP가 완료되었는지 여부
         public bool IsComplete { get; set; }
 
-        // 이 GOP의 모든 프레임 (프레임 ID -> 프레임 데이터)
+        // 프레임 컬렉션
         public ConcurrentDictionary<long, FrameData> Frames { get; } = new ConcurrentDictionary<long, FrameData>();
+
+        // 디코딩 성공 여부
+        public bool IsDecodingSuccessful { get; set; }
+
+        // 마지막 액세스 시간
+        public DateTime LastAccessTime { get; set; } = DateTime.UtcNow;
+
+        // 이 GOP에 프레임을 추가
+        public void AddFrame(FrameData frame)
+        {
+            Frames[frame.FrameId] = frame;
+            LastAccessTime = DateTime.UtcNow;
+
+            // 키프레임인 경우 시작 시간 설정
+            if (frame.IsKeyFrame)
+            {
+                KeyFrameId = frame.FrameId;
+            }
+        }
+
+        // 처리되지 않은 프레임 수 계산
+        public int GetUnprocessedFrameCount()
+        {
+            return Frames.Count(pair => !pair.Value.IsProcessed);
+        }
+
+        // GOP 유효성 확인
+        public bool IsValid()
+        {
+            return Frames.Any(pair => pair.Value.IsKeyFrame);
+        }
+
+        // 모든 프레임 제거
+        public void Clear()
+        {
+            Frames.Clear();
+        }
     }
 
     /// <summary>

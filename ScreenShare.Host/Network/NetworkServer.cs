@@ -438,43 +438,42 @@ namespace ScreenShare.Host.Network
             if (!_processingQueues.TryGetValue(clientNumber, out var queue))
                 return;
 
-            // 큐에서 프레임 찾기
-            var frameList = new FrameProcessingTask[queue.Count];
-            int count = 0;
+            var tempQueue = new ConcurrentQueue<FrameProcessingTask>();
             bool found = false;
+            int queueSizeBefore = queue.Count;
 
-            // 프레임을 찾거나 큐가 비워질 때까지 디큐
             while (queue.TryDequeue(out var task))
             {
                 if (task.FrameId == frameId)
                 {
-                    // 처리 시간 계산
                     long endTime = Stopwatch.GetTimestamp();
                     long elapsedTicks = endTime - task.StartTime;
                     long elapsedMicroseconds = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
 
-                    // 응답 전송
                     SendFrameAcknowledgment(clientNumber, frameId, (int)elapsedMicroseconds, queue.Count);
                     found = true;
 
-                    // 성능 추적기 업데이트
                     if (_clientPerformance.TryGetValue(clientNumber, out var tracker))
                     {
                         tracker.AddProcessingTime(elapsedMicroseconds);
-                        tracker.UpdateQueueDepth(queue.Count);
                     }
-
-                    break;
                 }
-
-                // 필요한 경우 다시 큐에 넣기 위해 저장
-                frameList[count++] = task;
+                else
+                {
+                    tempQueue.Enqueue(task);
+                }
             }
 
-            // 타겟을 찾기 전에 디큐한 항목을 다시 큐에 넣기
-            for (int i = 0; i < count; i++)
+            while (tempQueue.TryDequeue(out var task))
             {
-                queue.Enqueue(frameList[i]);
+                queue.Enqueue(task);
+            }
+
+            int queueSizeAfter = queue.Count;
+
+            if (_clientPerformance.TryGetValue(clientNumber, out var perfTracker))
+            {
+                perfTracker.UpdateQueueDepth(queue.Count);
             }
 
             if (!found)
