@@ -699,7 +699,7 @@ namespace ScreenShare.Host.Processing
                     {
                         EnhancedLogger.Instance.Warning(
                             $"클라이언트 {clientNumber} 디코딩 오류 과다({errorCount}회) - 키프레임 요청");
-                        RequestKeyframe(clientNumber, $"누적 {errorCount}회 디코딩 실패");
+                        //RequestKeyframe(clientNumber, $"누적 {errorCount}회 디코딩 실패");
                         _decodingErrorCounters[clientNumber] = 0;
                     }
 

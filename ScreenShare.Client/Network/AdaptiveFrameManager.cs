@@ -218,22 +218,22 @@ namespace ScreenShare.Client.Network
                 bool queueGrowing = _pendingFrames > _pendingFramesLastCheck;
                 _pendingFramesLastCheck = _pendingFrames;
 
-                if (!isKeyFrame && _frameThrottling && (_pendingFrames >= _maxPendingFrames || (queueGrowing && _pendingFrames >= _maxPendingFrames / 2)))
-                {
-                    _consecutiveFrameDrops++;
-                    EnhancedLogger.Instance.Debug(
-                        $"프레임 제한: 대기={_pendingFrames}, 최대={_maxPendingFrames}, " +
-                        $"연속 드롭={_consecutiveFrameDrops}, 큐 증가 중={queueGrowing}");
+                //if (!isKeyFrame && _frameThrottling && (_pendingFrames >= _maxPendingFrames || (queueGrowing && _pendingFrames >= _maxPendingFrames / 2)))
+                //{
+                //    _consecutiveFrameDrops++;
+                //    EnhancedLogger.Instance.Debug(
+                //        $"프레임 제한: 대기={_pendingFrames}, 최대={_maxPendingFrames}, " +
+                //        $"연속 드롭={_consecutiveFrameDrops}, 큐 증가 중={queueGrowing}");
 
-                    if (_consecutiveFrameDrops >= 10)
-                    {
-                        _forceKeyframe = true;
-                        _consecutiveFrameDrops = 0;
-                        EnhancedLogger.Instance.Warning("연속 프레임 드롭으로 인한 키프레임 요청");
-                    }
+                //    if (_consecutiveFrameDrops >= 10)
+                //    {
+                //        _forceKeyframe = true;
+                //        _consecutiveFrameDrops = 0;
+                //        EnhancedLogger.Instance.Warning("연속 프레임 드롭으로 인한 키프레임 요청");
+                //    }
 
-                    return false;
-                }
+                //    return false;
+                //}
 
                 _lastFrameSentTime = DateTime.Now;
                 _lastFrameId++;
