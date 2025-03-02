@@ -32,6 +32,8 @@ namespace ScreenShare.Client.Forms
         private ToolStripStatusLabel _bitrateLabel;
         private ToolStripStatusLabel _pingLabel;
 
+        private Dictionary<Bitmap, double> _captureTimes = new Dictionary<Bitmap, double>();
+        private readonly object _captureTimesLock = new object();
         public MainForm()
         {
             InitializeComponent();
@@ -96,6 +98,7 @@ namespace ScreenShare.Client.Forms
                 KeyPreview = true;
                 KeyDown += OnKeyDown;
 
+                _encoder.FrameEncoded += OnFrameEncoded;
                 EnhancedLogger.Instance.Info("Main form initialization complete");
             }
             catch (Exception ex)
@@ -197,6 +200,16 @@ namespace ScreenShare.Client.Forms
             lock (_syncLock)
             {
                 lblStatus.Text = "Status: Shutting down...";
+                lock (_captureTimesLock)
+                {
+                    _captureTimes.Clear();
+                }
+
+                // 이벤트 구독 해제
+                if (_encoder != null)
+                {
+                    _encoder.FrameEncoded -= OnFrameEncoded;
+                }
 
                 _networkUpdateTimer?.Stop();
                 _statusUpdateTimer?.Stop();
@@ -206,27 +219,30 @@ namespace ScreenShare.Client.Forms
                 _screenCapture?.Dispose();
                 _encoder?.Dispose();
                 _networkClient?.Dispose();
+                
 
                 EnhancedLogger.Instance.Info("Main form closed");
                 EnhancedLogger.Instance.Dispose();
+
             }
         }
 
-        private void OnFrameCaptured(object sender, Bitmap bitmap)
+        private void OnFrameCaptured(object sender, OptimizedScreenCapture.CaptureData captureData)
         {
             try
             {
-                // Bitmap is already cloned so encode directly
-                _encoder.EncodeFrame(bitmap);
+                // 캡처 시간과 비트맵을 연결하여 저장
+                lock (_captureTimesLock)
+                {
+                    _captureTimes[captureData.Bitmap] = captureData.CaptureTimeMs;
+                }
+
+                // 비트맵 인코딩
+                _encoder.EncodeFrame(captureData.Bitmap);
             }
             catch (Exception ex)
             {
                 EnhancedLogger.Instance.Error("Encoding error", ex);
-            }
-            finally
-            {
-                // Dispose bitmap as it was cloned in OptimizedScreenCapture
-                bitmap.Dispose();
             }
         }
 
@@ -234,11 +250,42 @@ namespace ScreenShare.Client.Forms
         {
             try
             {
+                // 네트워크로 데이터 전송
                 _networkClient.SendScreenData(
                     e.EncodedData,
                     Screen.PrimaryScreen.Bounds.Width,
                     Screen.PrimaryScreen.Bounds.Height,
                     e.IsKeyFrame);
+
+                // 캡처 시간 정보 조회
+                double captureTimeMs = 0;
+
+                // 이 부분은 실제로는 비트맵을 키로 찾을 수 없기 때문에 정확하지 않습니다.
+                // 프레임 ID를 전체 파이프라인에서 추적하는 것이 더 정확합니다.
+                // 하지만 기존 구조를 최소한으로 변경하기 위해 이 방식 사용
+
+                lock (_captureTimesLock)
+                {
+                    // 오래된 캡처 시간 정보는 제거 (메모리 누수 방지)
+                    if (_captureTimes.Count > 30)
+                    {
+                        // 가장 오래된 항목 5개 제거
+                        var oldestItems = _captureTimes.Keys.Take(5).ToList();
+                        foreach (var key in oldestItems)
+                        {
+                            _captureTimes.Remove(key);
+                        }
+                    }
+
+                    // 가장 최근 캡처 시간 사용 (정확하지 않지만 근사값)
+                    if (_captureTimes.Count > 0)
+                    {
+                        captureTimeMs = _captureTimes.Values.Average();
+                    }
+                }
+
+                // 처리 시간 정보를 스크린 캡처에 전달
+                _screenCapture.OnEncodingCompleted(captureTimeMs, e.EncodingTimeMs);
             }
             catch (Exception ex)
             {
@@ -276,21 +323,33 @@ namespace ScreenShare.Client.Forms
 
             if (isActive)
             {
-                // Remote control mode activated
+                // 원격 제어 모드 활성화
                 _statusLabel.Text = "Remote control mode active";
                 EnhancedLogger.Instance.Info($"Remote control mode activated (FPS: {_settings.HighResFps}, Quality: {_settings.HighResQuality})");
 
-                // Set process priority higher for remote control
+                // 원격 모드로 전환 - 스크린 캡처 설정 및 처리 시간 이력 초기화
+                _screenCapture.SetRemoteMode(true, _settings.HighResFps, _settings.HighResQuality);
+
+                // 비트레이트 조정
+                _encoder.SetBitrate(20_000_000); // 20 Mbps - 원격 모드에서 높은 비트레이트
+
+                // 프로세스 우선순위 높임
                 if (Process.GetCurrentProcess().PriorityClass != ProcessPriorityClass.AboveNormal)
                     Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.AboveNormal;
             }
             else
             {
-                // Normal mode
+                // 일반 모드
                 _statusLabel.Text = "Connected: Transmitting screen";
                 EnhancedLogger.Instance.Info($"Normal mode (FPS: {_settings.LowResFps}, Quality: {_settings.LowResQuality})");
 
-                // Reset process priority
+                // 일반 모드로 전환 - 스크린 캡처 설정 및 처리 시간 이력 초기화
+                _screenCapture.SetRemoteMode(false, _settings.LowResFps, _settings.LowResQuality);
+
+                // 비트레이트 조정
+                _encoder.SetBitrate(10_000_000); // 10 Mbps - 일반 모드에서 낮은 비트레이트
+
+                // 프로세스 우선순위 복원
                 if (Process.GetCurrentProcess().PriorityClass != ProcessPriorityClass.Normal)
                     Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.Normal;
             }

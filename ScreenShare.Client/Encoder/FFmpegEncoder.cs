@@ -527,8 +527,10 @@ namespace ScreenShare.Client.Encoder
 
         public void EncodeFrame(Bitmap bitmap)
         {
-            if (_isDisposed)
+            if (_isDisposed || bitmap == null)
                 return;
+
+            Stopwatch encodingTimer = Stopwatch.StartNew();
 
             lock (_encodeLock)
             {
@@ -595,11 +597,11 @@ namespace ScreenShare.Client.Encoder
 
                     if (_isHardwareEncodingEnabled && _hwFrame != null && _context->hw_frames_ctx != null)
                     {
-                        EncodeWithHardware();
+                        EncodeWithHardware(isKeyframe, encodingTimer);
                     }
                     else
                     {
-                        EncodeWithSoftware();
+                        EncodeWithSoftware(isKeyframe, encodingTimer);
                     }
 
                     sw.Stop();
@@ -625,7 +627,7 @@ namespace ScreenShare.Client.Encoder
             }
         }
 
-        private void EncodeWithHardware()
+        private void EncodeWithHardware(bool isKeyFrame, Stopwatch encodingTimer)
         {
             try
             {
@@ -635,7 +637,7 @@ namespace ScreenShare.Client.Encoder
                 {
                     string errorMsg = GetErrorMessage(ret);
                     EnhancedLogger.Instance.Error($"하드웨어 프레임 버퍼 할당 실패: {errorMsg}");
-                    EncodeWithSoftware(); // 소프트웨어 인코딩으로 폴백
+                    EncodeWithSoftware(isKeyFrame, encodingTimer);
                     return;
                 }
 
@@ -644,7 +646,7 @@ namespace ScreenShare.Client.Encoder
                 {
                     string errorMsg = GetErrorMessage(ret);
                     EnhancedLogger.Instance.Error($"하드웨어 프레임 데이터 전송 실패: {errorMsg}");
-                    EncodeWithSoftware(); // 소프트웨어 인코딩으로 폴백
+                    EncodeWithSoftware(isKeyFrame, encodingTimer);
                     return;
                 }
 
@@ -657,21 +659,21 @@ namespace ScreenShare.Client.Encoder
                 {
                     string errorMsg = GetErrorMessage(ret);
                     EnhancedLogger.Instance.Error($"하드웨어 프레임 인코딩 실패: {errorMsg}");
-                    EncodeWithSoftware(); // 소프트웨어 인코딩으로 폴백
+                    EncodeWithSoftware(isKeyFrame, encodingTimer);
                     return;
                 }
 
                 // 인코딩된 패킷 수신
-                ReceivePackets();
+                ReceivePackets(isKeyFrame, encodingTimer);
             }
             catch (Exception ex)
             {
                 EnhancedLogger.Instance.Error($"하드웨어 인코딩 오류: {ex.Message}", ex);
-                EncodeWithSoftware(); // 소프트웨어 인코딩으로 폴백
+                EncodeWithSoftware(isKeyFrame, encodingTimer);
             }
         }
 
-        private void EncodeWithSoftware()
+        private void EncodeWithSoftware(bool isKeyFrame, Stopwatch encodingTimer)
         {
             try
             {
@@ -685,7 +687,7 @@ namespace ScreenShare.Client.Encoder
                 }
 
                 // 인코딩된 패킷 수신
-                ReceivePackets();
+                ReceivePackets(isKeyFrame, encodingTimer);
             }
             catch (Exception ex)
             {
@@ -693,7 +695,7 @@ namespace ScreenShare.Client.Encoder
             }
         }
 
-        private void ReceivePackets()
+        private void ReceivePackets(bool isKeyFrame, Stopwatch encodingTimer)
         {
             try
             {
@@ -715,21 +717,26 @@ namespace ScreenShare.Client.Encoder
                     Marshal.Copy((IntPtr)_packet->data, encodedData, 0, _packet->size);
 
                     // 키프레임 여부 확인
-                    bool isKeyFrame = (_packet->flags & ffmpeg.AV_PKT_FLAG_KEY) != 0;
+                    bool isKeyframePacket = (_packet->flags & ffmpeg.AV_PKT_FLAG_KEY) != 0;
+
+                    // 인코딩 시간 계산
+                    double encodingTimeMs = encodingTimer.Elapsed.TotalMilliseconds;
 
                     // 이벤트 인자 생성
                     var args = new FrameEncodedEventArgs
                     {
                         EncodedData = encodedData,
-                        IsKeyFrame = isKeyFrame
+                        IsKeyFrame = isKeyframePacket || isKeyFrame,
+                        EncodingTimeMs = encodingTimeMs
                     };
 
                     // 이벤트 트리거
                     FrameEncoded?.Invoke(this, args);
 
-                    if (isKeyFrame)
+                    if (args.IsKeyFrame)
                     {
-                        EnhancedLogger.Instance.Info($"키프레임 생성: size={encodedData.Length}");
+                        EnhancedLogger.Instance.Info(
+                            $"키프레임 생성: size={encodedData.Length}, 인코딩 시간={encodingTimeMs:F1}ms");
                     }
 
                     ffmpeg.av_packet_unref(_packet);
@@ -833,5 +840,10 @@ namespace ScreenShare.Client.Encoder
         /// 키프레임 여부
         /// </summary>
         public bool IsKeyFrame { get; set; }
+
+        /// <summary>
+        /// 인코딩에 소요된 시간 (밀리초)
+        /// </summary>
+        public double EncodingTimeMs { get; set; }
     }
 }

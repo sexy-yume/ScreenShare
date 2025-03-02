@@ -15,6 +15,7 @@ using DXGIResultCode = SharpDX.DXGI.ResultCode;
 
 namespace ScreenShare.Client.Capture
 {
+    
     public class OptimizedScreenCapture : IDisposable
     {
         private readonly Device _device;
@@ -35,7 +36,20 @@ namespace ScreenShare.Client.Capture
         private int _frameCount = 0;
         private int _failedCaptureCount = 0;
 
-        public event EventHandler<Bitmap> FrameCaptured;
+        public event EventHandler<CaptureData> FrameCaptured;
+
+        private readonly Queue<double> _processingTimeHistory = new Queue<double>(30); // 최근 30개 프레임의 처리 시간
+        private readonly object _historyLock = new object();
+        private double _averageProcessingTime = 0;
+        private double _lastCaptureTimeMs = 0;
+        private double _lastEncodingTimeMs = 0;
+        private bool _remoteModeActive = false;
+
+        public class CaptureData : EventArgs
+        {
+            public Bitmap Bitmap { get; set; }
+            public double CaptureTimeMs { get; set; }
+        }
 
         public int Fps
         {
@@ -137,37 +151,80 @@ namespace ScreenShare.Client.Capture
         private void CaptureLoop()
         {
             Stopwatch frameTimer = new Stopwatch();
-            
+            Stopwatch captureTimer = new Stopwatch();
+            DateTime lastCaptureTime = DateTime.MinValue;
 
             while (_capturing)
             {
-                frameTimer.Restart();
-                int targetFrameTime = 1000 / _fps;
                 try
                 {
-                    // 화면 캡처
+                    frameTimer.Restart();
+
+                    // 1. 목표 프레임 간격 (ms)
+                    int targetFrameTime = 1000 / _fps;
+
+                    // 2. 순수 처리 시간(캡처+인코딩)이 목표 간격보다 길면 적응
+                    // 평균 처리 시간에 5% 여유를 추가하여 적응형 간격 계산
+                    double adaptiveInterval = Math.Max(targetFrameTime, _averageProcessingTime * 1.05);
+
+                    // 3. 현재 시간과 마지막 캡처 시간의 간격 확인
+                    TimeSpan timeSinceLastCapture = DateTime.Now - lastCaptureTime;
+
+                    // 4. 적응형 간격보다 짧게 지났으면 대기
+                    if (timeSinceLastCapture.TotalMilliseconds < adaptiveInterval - 2) // 2ms 여유
+                    {
+                        int waitTime = (int)(adaptiveInterval - timeSinceLastCapture.TotalMilliseconds);
+                        if (waitTime > 1)
+                        {
+                            // 반응성을 위해 최소한의 대기만 수행
+                            Thread.Sleep(Math.Min(waitTime / 2, 5));
+                            continue;
+                        }
+                    }
+
+                    // 5. 화면 캡처 수행
+                    captureTimer.Restart();
                     byte[] screenData = CaptureScreen(50); // 50ms 타임아웃
+                    double captureTimeMs = captureTimer.ElapsedMilliseconds;
 
                     if (screenData != null)
                     {
                         _failedCaptureCount = 0;
                         _frameCount++;
 
-                        // BGRA 바이트 배열을 Bitmap으로 변환
+                        // 캡처 시간 기록
+                        lastCaptureTime = DateTime.Now;
+
+                        // 6. Bitmap 변환 및 인코딩
                         using (Bitmap bitmap = CreateBitmapFromBuffer(screenData, _width, _height))
                         {
                             if (bitmap != null)
                             {
-                                // 타임스탬프 표시 (디버깅용, 필요 없으면 제거)
+                                // 타임스탬프와 성능 정보 표시
                                 using (Graphics g = Graphics.FromImage(bitmap))
                                 {
-                                    string text = $"{DateTime.Now:HH:mm:ss.fff}";
-                                    g.DrawString(text, new Font("Arial", 10), Brushes.Yellow, 10, 10);
+                                    string timeText = $"{DateTime.Now:HH:mm:ss.fff}";
+                                    g.DrawString(timeText, new Font("Arial", 10), Brushes.Yellow, 10, 10);
+
+                                    // 성능 정보 표시
+                                    string perfText = $"Cap: {_lastCaptureTimeMs:F1}ms, Enc: {_lastEncodingTimeMs:F1}ms, " +
+                                                    $"Total: {_averageProcessingTime:F1}ms, " +
+                                                    $"Mode: {(_remoteModeActive ? "Remote" : "Normal")}";
+                                    g.DrawString(perfText, new Font("Arial", 10), Brushes.Lime, 10, 30);
                                 }
 
                                 // 클론을 만들어 이벤트 발생 (비트맵 객체가 일회용이므로)
                                 Bitmap clonedBitmap = new Bitmap(bitmap);
-                                FrameCaptured?.Invoke(this, clonedBitmap);
+
+                                // 캡처 시간 전달 (OnFrameCaptured 핸들러에서 사용)
+                                var captureData = new CaptureData
+                                {
+                                    Bitmap = clonedBitmap,
+                                    CaptureTimeMs = captureTimeMs
+                                };
+
+                                // 비트맵과 함께 캡처 시간도 전달
+                                FrameCaptured?.Invoke(this, captureData);
                             }
                         }
                     }
@@ -187,22 +244,21 @@ namespace ScreenShare.Client.Capture
                     if (_fpsTimer.ElapsedMilliseconds >= 5000)
                     {
                         double seconds = _fpsTimer.ElapsedMilliseconds / 1000.0;
-                        double fps = _frameCount / seconds;
-                        FileLogger.Instance.WriteInfo($"캡처 FPS: {fps:F1}, 총 프레임: {_frameCount}");
-                        
+                        double actualFps = _frameCount / seconds;
+                        double theoreticalMaxFps = 1000 / Math.Max(1, _averageProcessingTime);
+
+                        FileLogger.Instance.WriteInfo(
+                            $"캡처 통계: 실제 FPS={actualFps:F1}, 목표 FPS={_fps}, " +
+                            $"가능한 최대 FPS={theoreticalMaxFps:F1}, " +
+                            $"평균 처리 시간={_averageProcessingTime:F1}ms, " +
+                            $"현재 모드={(_remoteModeActive ? "원격" : "일반")}");
+
                         _frameCount = 0;
                         _fpsTimer.Restart();
                     }
 
-                    // 프레임 레이트 조절
-                    int elapsed = (int)frameTimer.ElapsedMilliseconds;
-                    int sleepTime = Math.Max(0, targetFrameTime - elapsed);
-
-                    if (sleepTime > 0)
-                    {
-                        //FileLogger.Instance.WriteInfo($"sleepTime : {sleepTime}");
-                        Thread.Sleep(sleepTime);
-                    }
+                    // 짧은 지연으로 CPU 사용량 제어 (선택적)
+                    Thread.Sleep(1);
                 }
                 catch (Exception ex)
                 {
@@ -308,6 +364,71 @@ namespace ScreenShare.Client.Capture
                 FileLogger.Instance.WriteError("비트맵 생성 오류", ex);
                 return null;
             }
+        }
+        public void SetRemoteMode(bool active, int newFps, int newQuality)
+        {
+            _remoteModeActive = active;
+            Fps = newFps;
+            Quality = newQuality;
+
+            // 중요: 모드 변경 시 처리 시간 히스토리 초기화 
+            ResetProcessingTimeHistory();
+
+            EnhancedLogger.Instance.Info(
+                $"{(active ? "원격 제어" : "일반")} 모드 설정: FPS={Fps}, 품질={Quality}");
+        }
+
+        // 처리 시간 히스토리 초기화 (FPS 변경 시 호출)
+        private void ResetProcessingTimeHistory()
+        {
+            lock (_historyLock)
+            {
+                _processingTimeHistory.Clear();
+                _averageProcessingTime = 0;
+
+                // 첫 몇 개 프레임은 빠르게 적응하도록 작은 초기값으로 설정
+                for (int i = 0; i < 5; i++)
+                {
+                    _processingTimeHistory.Enqueue(10); // 10ms 초기값 (빠른 적응)
+                }
+                UpdateAverageProcessingTime();
+            }
+        }
+
+        // 처리 시간 히스토리 업데이트 및 평균 계산
+        private void AddProcessingTime(double captureTimeMs, double encodingTimeMs)
+        {
+            _lastCaptureTimeMs = captureTimeMs;
+            _lastEncodingTimeMs = encodingTimeMs;
+            double totalProcessingTime = captureTimeMs + encodingTimeMs;
+
+            lock (_historyLock)
+            {
+                // 히스토리 크기 제한
+                if (_processingTimeHistory.Count >= 30)
+                {
+                    _processingTimeHistory.Dequeue();
+                }
+
+                _processingTimeHistory.Enqueue(totalProcessingTime);
+                UpdateAverageProcessingTime();
+            }
+        }
+
+        // 평균 처리 시간 업데이트
+        private void UpdateAverageProcessingTime()
+        {
+            if (_processingTimeHistory.Count == 0)
+                return;
+
+            _averageProcessingTime = _processingTimeHistory.Average();
+        }
+
+        // 인코딩 완료 이벤트 처리 메서드 - 클래스에 추가
+        public void OnEncodingCompleted(double captureTimeMs, double encodingTimeMs)
+        {
+            // 처리 시간 히스토리 업데이트
+            AddProcessingTime(captureTimeMs, encodingTimeMs);
         }
 
         public void Dispose()
