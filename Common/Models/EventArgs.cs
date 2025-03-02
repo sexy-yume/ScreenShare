@@ -17,6 +17,11 @@ namespace ScreenShare.Host.Network
             ClientInfo = clientInfo;
         }
     }
+    public class FrameEncodedEventArgs : EventArgs
+    {
+        public byte[] EncodedData { get; set; }
+        public bool IsKeyFrame { get; set; }
+    }
 
     /// <summary>
     /// Event arguments for screen data events
@@ -28,14 +33,16 @@ namespace ScreenShare.Host.Network
         public int Width { get; }
         public int Height { get; }
         public long FrameId { get; }
+        public bool IsKeyFrame { get; }
 
-        public ScreenDataEventArgs(int clientNumber, byte[] screenData, int width, int height, long frameId = 0)
+        public ScreenDataEventArgs(int clientNumber, byte[] screenData, int width, int height, long frameId = 0, bool isKeyFrame = false)
         {
             ClientNumber = clientNumber;
             ScreenData = screenData;
             Width = width;
             Height = height;
             FrameId = frameId;
+            IsKeyFrame = isKeyFrame;
         }
     }
 

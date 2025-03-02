@@ -27,6 +27,9 @@ namespace ScreenShare.Common.Models
         [JsonInclude]
         public long FrameId { get; set; }
 
+        [JsonInclude]
+        public bool IsKeyFrame { get; set; }
+
         // Remote control fields
         [JsonInclude]
         public int? MouseX { get; set; }

@@ -230,14 +230,15 @@ namespace ScreenShare.Client.Forms
             }
         }
 
-        private void OnFrameEncoded(object sender, byte[] encodedData)
+        private void OnFrameEncoded(object sender, FrameEncodedEventArgs e)
         {
             try
             {
                 _networkClient.SendScreenData(
-                    encodedData,
+                    e.EncodedData,
                     Screen.PrimaryScreen.Bounds.Width,
-                    Screen.PrimaryScreen.Bounds.Height);
+                    Screen.PrimaryScreen.Bounds.Height,
+                    e.IsKeyFrame);
             }
             catch (Exception ex)
             {

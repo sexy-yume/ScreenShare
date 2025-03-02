@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Diagnostics;
+using System.Linq;
 using LiteNetLib;
 using LiteNetLib.Utils;
 using ScreenShare.Common.Models;
@@ -23,6 +24,10 @@ namespace ScreenShare.Host.Network
         private ConcurrentDictionary<int, ConcurrentQueue<FrameProcessingTask>> _processingQueues =
             new ConcurrentDictionary<int, ConcurrentQueue<FrameProcessingTask>>();
         private int _maxQueueSize = 3;
+
+        // 키프레임 요청 관련
+        private ConcurrentDictionary<int, DateTime> _lastKeyframeRequestTime = new ConcurrentDictionary<int, DateTime>();
+        private TimeSpan _minKeyframeRequestInterval = TimeSpan.FromSeconds(5); // 최소 5초 간격
 
         public event EventHandler<ClientEventArgs> ClientConnected;
         public event EventHandler<ClientEventArgs> ClientDisconnected;
@@ -64,6 +69,7 @@ namespace ScreenShare.Host.Network
             _clientInfos.Clear();
             _clientPerformance.Clear();
             _processingQueues.Clear();
+            _lastKeyframeRequestTime.Clear();
             EnhancedLogger.Instance.Info("Network server stopped");
         }
 
@@ -83,6 +89,51 @@ namespace ScreenShare.Host.Network
                         Metrics = metrics
                     });
                 }
+            }
+        }
+
+        /// <summary>
+        /// 클라이언트에 키프레임 요청을 보냅니다.
+        /// </summary>
+        /// <param name="clientNumber">클라이언트 번호</param>
+        /// <returns>성공 여부</returns>
+        public bool RequestKeyframe(int clientNumber)
+        {
+            if (!_clientPeers.TryGetValue(clientNumber, out var peer))
+                return false;
+
+            // 최소 요청 간격 체크
+            DateTime now = DateTime.UtcNow;
+            DateTime lastRequest = _lastKeyframeRequestTime.GetOrAdd(clientNumber, DateTime.MinValue);
+            if ((now - lastRequest) < _minKeyframeRequestInterval)
+            {
+                EnhancedLogger.Instance.Debug($"키프레임 요청 간격 제한: 클라이언트 {clientNumber}, 마지막 요청으로부터 {(now - lastRequest).TotalSeconds:F1}초");
+                return false;
+            }
+
+            try
+            {
+                // KeyframeRequest 패킷 생성
+                var packet = new ScreenPacket
+                {
+                    Type = PacketType.KeyframeRequest,
+                    ClientNumber = clientNumber,
+                    Timestamp = DateTimeOffset.Now.ToUnixTimeMilliseconds()
+                };
+
+                byte[] serializedData = PacketSerializer.Serialize(packet);
+                peer.Send(serializedData, DeliveryMethod.ReliableOrdered);
+
+                // 마지막 요청 시간 업데이트
+                _lastKeyframeRequestTime[clientNumber] = now;
+
+                EnhancedLogger.Instance.Info($"클라이언트 {clientNumber}에 키프레임 요청 전송");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                EnhancedLogger.Instance.Error($"키프레임 요청 전송 오류: {ex.Message}", ex);
+                return false;
             }
         }
 
@@ -324,6 +375,7 @@ namespace ScreenShare.Host.Network
                     _clientInfos.TryRemove(client.Key, out var clientInfo);
                     _clientPerformance.TryRemove(client.Key, out _);
                     _processingQueues.TryRemove(client.Key, out _);
+                    _lastKeyframeRequestTime.TryRemove(client.Key, out _);
 
                     ClientDisconnected?.Invoke(this, new ClientEventArgs(client.Key, clientInfo));
                     break;
@@ -376,7 +428,8 @@ namespace ScreenShare.Host.Network
 
                             // Start tracking frame processing
                             long frameId = packet.FrameId;
-                            EnhancedLogger.Instance.Debug($"Received frame from client {packet.ClientNumber}, id={frameId}, size={packet.ScreenData.Length}");
+                            bool isKeyFrame = packet.IsKeyFrame;
+                            EnhancedLogger.Instance.Debug($"Received frame from client {packet.ClientNumber}, id={frameId}, keyframe={isKeyFrame}, size={packet.ScreenData.Length}");
                             BeginFrameProcessing(packet.ClientNumber, frameId);
 
                             // Track frame size
@@ -385,9 +438,14 @@ namespace ScreenShare.Host.Network
                                 tracker.AddFrame(data.Length);
                             }
 
-                            // Raise event for actual processing
+                            // Raise event for actual processing with keyframe info
                             ScreenDataReceived?.Invoke(this, new ScreenDataEventArgs(
-                                packet.ClientNumber, packet.ScreenData, packet.Width, packet.Height, frameId));
+                                packet.ClientNumber,
+                                packet.ScreenData,
+                                packet.Width,
+                                packet.Height,
+                                frameId,
+                                isKeyFrame));
                         }
                         break;
                 }

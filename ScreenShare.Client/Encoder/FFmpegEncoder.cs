@@ -3,6 +3,8 @@ using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using FFmpeg.AutoGen;
 
 namespace ScreenShare.Client.Encoder
@@ -28,7 +30,11 @@ namespace ScreenShare.Client.Encoder
         private AVBufferRef* _hwDeviceCtx = null;
         private AVFrame* _hwFrame = null;
 
-        public event EventHandler<byte[]> FrameEncoded;
+        // 키프레임 요청 관련 필드 추가
+        private bool _forceKeyframe = false;
+        private int _origGopSize = 10;
+
+        public event EventHandler<FrameEncodedEventArgs> FrameEncoded;
 
         public FFmpegEncoder(int width, int height, int quality = 70, int bitrate = 10000000)
         {
@@ -152,6 +158,7 @@ namespace ScreenShare.Client.Encoder
             _context->rc_max_rate = _bitrate * 2;
             _context->rc_buffer_size = _bitrate;
             _context->gop_size = 30;
+            _origGopSize = 30; // 원래 GOP 크기 저장
             _context->max_b_frames = 0;
             _context->pix_fmt = GetHardwarePixelFormat();
             _context->codec_type = AVMediaType.AVMEDIA_TYPE_VIDEO;
@@ -293,6 +300,7 @@ namespace ScreenShare.Client.Encoder
             _context->rc_max_rate = _bitrate * 2;
             _context->rc_buffer_size = _bitrate;
             _context->gop_size = 10;  // 원래 설정으로 복원
+            _origGopSize = 10; // 원래 GOP 크기 저장
             _context->max_b_frames = 0;
             _context->pix_fmt = AVPixelFormat.AV_PIX_FMT_YUV420P;
             _context->codec_type = AVMediaType.AVMEDIA_TYPE_VIDEO;
@@ -383,6 +391,49 @@ namespace ScreenShare.Client.Encoder
             }
         }
 
+        /// <summary>
+        /// 키프레임을 강제로 생성합니다.
+        /// </summary>
+        public void ForceKeyframe()
+        {
+            if (_isDisposed)
+                return;
+
+            lock (_encodeLock)
+            {
+                try
+                {
+                    Console.WriteLine("키프레임 강제 생성 요청");
+                    _forceKeyframe = true;
+
+                    // 하드웨어 인코더에서 강제 키프레임 설정
+                    if (_isHardwareEncodingEnabled && _context->priv_data != null)
+                    {
+                        // NVENC의 경우 force_key 또는 forced_idr 사용
+                        if (_hwType == AVHWDeviceType.AV_HWDEVICE_TYPE_CUDA)
+                        {
+                            ffmpeg.av_opt_set(_context->priv_data, "forced_idr", "1", 0);
+                        }
+                        // QSV의 경우
+                        else if (_hwType == AVHWDeviceType.AV_HWDEVICE_TYPE_QSV)
+                        {
+                            ffmpeg.av_opt_set(_context->priv_data, "forced_key", "1", 0);
+                        }
+                    }
+                    else
+                    {
+                        // 소프트웨어 인코더의 경우 GOP 크기를 1로 변경
+                        // (다음 프레임은 무조건 키프레임이 됨)
+                        _context->gop_size = 1;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"키프레임 강제 생성 오류: {ex.Message}");
+                }
+            }
+        }
+
         private string GetErrorMessage(int errorCode)
         {
             const int bufferSize = 1024;
@@ -433,6 +484,28 @@ namespace ScreenShare.Client.Encoder
 
                     // Set timestamp
                     _frame->pts = _frameCount++;
+
+                    // 키프레임 강제 요청 처리
+                    if (_forceKeyframe)
+                    {
+                        // pict_type을 I-frame으로 설정
+                        _frame->pict_type = AVPictureType.AV_PICTURE_TYPE_I;
+                        _forceKeyframe = false;
+
+                        // GOP 크기를 원래대로 복원 (다음 프레임부터)
+                        Task.Run(() =>
+                        {
+                            Thread.Sleep(100);  // 현재 프레임이 전송되도록 잠시 대기
+                            lock (_encodeLock)
+                            {
+                                if (!_isDisposed)
+                                {
+                                    _context->gop_size = _origGopSize;
+                                    Console.WriteLine($"GOP 크기 복원: {_origGopSize}");
+                                }
+                            }
+                        });
+                    }
 
                     if (_isHardwareEncodingEnabled && _hwFrame != null && _context->hw_frames_ctx != null)
                     {
@@ -532,8 +605,23 @@ namespace ScreenShare.Client.Encoder
                 byte[] encodedData = new byte[_packet->size];
                 Marshal.Copy((IntPtr)_packet->data, encodedData, 0, _packet->size);
 
+                // Check if this is a keyframe
+                bool isKeyFrame = (_packet->flags & ffmpeg.AV_PKT_FLAG_KEY) != 0;
+
+                // Create frame encoded event args
+                var args = new FrameEncodedEventArgs
+                {
+                    EncodedData = encodedData,
+                    IsKeyFrame = isKeyFrame
+                };
+
                 // Trigger event
-                FrameEncoded?.Invoke(this, encodedData);
+                FrameEncoded?.Invoke(this, args);
+
+                if (isKeyFrame)
+                {
+                    Console.WriteLine($"키프레임 생성: size={encodedData.Length}");
+                }
 
                 ffmpeg.av_packet_unref(_packet);
             }
@@ -612,5 +700,21 @@ namespace ScreenShare.Client.Encoder
         {
             Dispose();
         }
+    }
+
+    /// <summary>
+    /// 인코딩된 프레임 이벤트 인자
+    /// </summary>
+    public class FrameEncodedEventArgs : EventArgs
+    {
+        /// <summary>
+        /// 인코딩된 프레임 데이터
+        /// </summary>
+        public byte[] EncodedData { get; set; }
+
+        /// <summary>
+        /// 키프레임 여부
+        /// </summary>
+        public bool IsKeyFrame { get; set; }
     }
 }

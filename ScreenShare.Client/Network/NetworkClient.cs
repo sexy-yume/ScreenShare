@@ -118,16 +118,23 @@ namespace ScreenShare.Client.Network
             _adaptiveManager?.Dispose();
         }
 
-        // Modified method to implement frame flow control
-        public bool SendScreenData(byte[] data, int width, int height)
+        // Modified method to implement frame flow control with keyframe awareness
+        public bool SendScreenData(byte[] data, int width, int height, bool isKeyFrame = false)
         {
             if (!IsConnected || data == null || data.Length == 0)
                 return false;
 
-            // Check with adaptive manager if we should send this frame
+            // 네트워크 상태가 안좋아 키프레임 요청이 필요한 경우
+            if (_adaptiveManager.ShouldForceKeyframe && !isKeyFrame)
+            {
+                EnhancedLogger.Instance.Info("네트워크 상태로 인한 키프레임 강제 요청");
+                return false; // 현재 프레임은 건너뛰고 키프레임이 생성되길 기다림
+            }
+
+            // 적응형 관리자에게 프레임 전송 가능 여부 확인
             if (!_adaptiveManager.BeginFrameSend())
             {
-                // Skip this frame based on adaptive rate control
+                // 적응형 속도 제어에 따라 이 프레임 건너뛰기
                 return false;
             }
 
@@ -135,13 +142,13 @@ namespace ScreenShare.Client.Network
             {
                 try
                 {
-                    // Generate frame ID for tracking
+                    // 프레임 ID 생성
                     long frameId = _nextFrameId++;
 
-                    // Store send time for RTT calculation
+                    // RTT 계산을 위해 전송 시간 저장
                     _pendingFrames[frameId] = DateTime.UtcNow;
 
-                    // Create packet with frame ID
+                    // 프레임 ID와 키프레임 정보를 포함한 패킷 생성
                     var packet = new ScreenPacket
                     {
                         Type = PacketType.ScreenData,
@@ -150,27 +157,28 @@ namespace ScreenShare.Client.Network
                         Width = width,
                         Height = height,
                         Timestamp = DateTimeOffset.Now.ToUnixTimeMilliseconds(),
-                        FrameId = frameId
+                        FrameId = frameId,
+                        IsKeyFrame = isKeyFrame
                     };
 
                     byte[] serializedData = PacketSerializer.Serialize(packet);
                     _server.Send(serializedData, DeliveryMethod.ReliableOrdered);
 
-                    // Log frame sending periodically
-                    if (frameId % 30 == 0)
+                    // 주기적으로 프레임 전송 로깅
+                    if (frameId % 30 == 0 || isKeyFrame)
                     {
-                        EnhancedLogger.Instance.Debug($"Sent frame id={frameId}, size={serializedData.Length}, pending={_pendingFrames.Count}");
+                        EnhancedLogger.Instance.Debug($"프레임 전송: id={frameId}, size={serializedData.Length}, 키프레임={isKeyFrame}, 대기중={_pendingFrames.Count}");
                     }
 
                     _bytesSent += serializedData.Length;
                     _framesSent++;
 
-                    // Update metrics
+                    // 메트릭 업데이트
                     _metrics.LastFrameSize = serializedData.Length;
                     _metrics.TotalBytesSent += serializedData.Length;
                     _metrics.TotalFramesSent++;
 
-                    // Log network statistics periodically
+                    // 주기적으로 네트워크 통계 로깅
                     if (_sendStatsTimer.ElapsedMilliseconds >= 5000)
                     {
                         double seconds = _sendStatsTimer.ElapsedMilliseconds / 1000.0;
@@ -182,13 +190,13 @@ namespace ScreenShare.Client.Network
                         _metrics.Ping = _server.Ping;
 
                         EnhancedLogger.Instance.Info(
-                            $"Network stats: {mbps:F2} Mbps, {fps:F1} fps, RTT: {_server.Ping}ms, " +
-                            $"Pending: {_pendingFrames.Count}, Packet loss: {_server.Statistics.PacketLossPercent:F1}%");
+                            $"네트워크 통계: {mbps:F2} Mbps, {fps:F1} fps, RTT: {_server.Ping}ms, " +
+                            $"대기중: {_pendingFrames.Count}, 패킷 손실: {_server.Statistics.PacketLossPercent:F1}%");
 
-                        // Update adaptive manager with packet loss info
+                        // 패킷 손실 정보로 적응형 관리자 업데이트
                         _adaptiveManager.UpdatePacketLoss((int)_server.Statistics.PacketLossPercent);
 
-                        // Notify listeners
+                        // 이벤트 구독자들에게 알림
                         PerformanceUpdated?.Invoke(this, _metrics);
 
                         _bytesSent = 0;
@@ -200,7 +208,7 @@ namespace ScreenShare.Client.Network
                 }
                 catch (Exception ex)
                 {
-                    EnhancedLogger.Instance.Error($"Data send error: {ex.Message}", ex);
+                    EnhancedLogger.Instance.Error($"데이터 전송 오류: {ex.Message}", ex);
                     return false;
                 }
             }
@@ -262,13 +270,20 @@ namespace ScreenShare.Client.Network
             EnhancedLogger.Instance.Error($"Network error: {endPoint} - {socketError}", null);
         }
 
-        // Modified OnNetworkReceive to handle frame acknowledgments
+        // Modified OnNetworkReceive to handle frame acknowledgments and keyframe requests
         public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNumber, DeliveryMethod deliveryMethod)
         {
             try
             {
                 byte[] data = reader.GetRemainingBytes();
                 var packet = PacketSerializer.Deserialize<ScreenPacket>(data);
+
+                // 키프레임 요청 처리
+                if (packet.Type == PacketType.KeyframeRequest)
+                {
+                    EnhancedLogger.Instance.Info("호스트로부터 키프레임 요청 수신");
+                    return;
+                }
 
                 // Check for frame acknowledgment
                 if (packet.Type == PacketType.FrameAck)

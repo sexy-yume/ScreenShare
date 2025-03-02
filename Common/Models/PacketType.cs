@@ -17,6 +17,7 @@ namespace ScreenShare.Common.Models
         MouseClick,     // 마우스 클릭
         KeyPress,       // 키보드 입력
         FrameAck,       // 프레임 수신 확인
-        NetworkStats    // 네트워크 통계
+        NetworkStats,   // 네트워크 통계
+        KeyframeRequest // 키프레임 요청
     }
 }

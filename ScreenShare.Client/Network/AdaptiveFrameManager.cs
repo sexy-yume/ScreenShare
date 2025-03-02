@@ -43,6 +43,11 @@ namespace ScreenShare.Client.Network
         private DateTime _lastFrameSentTime = DateTime.MinValue;
         private TimeSpan _minFrameInterval = TimeSpan.Zero;
 
+        // Keyframe control
+        private bool _forceKeyframe = false;
+        private DateTime? _lastKeyframeRequest = null;
+        private TimeSpan _minKeyframeInterval = TimeSpan.FromSeconds(5); // 최소 5초 간격으로 키프레임 요청
+
         public event EventHandler<AdaptiveSettingsChangedEventArgs> SettingsChanged;
 
         public int TargetFps
@@ -67,6 +72,34 @@ namespace ScreenShare.Client.Network
             : TimeSpan.Zero;
 
         /// <summary>
+        /// 키프레임 강제 생성이 필요한지 여부
+        /// </summary>
+        public bool ShouldForceKeyframe
+        {
+            get
+            {
+                lock (_syncLock)
+                {
+                    if (!_forceKeyframe)
+                        return false;
+
+                    // 최소 간격 체크
+                    if (_lastKeyframeRequest.HasValue &&
+                        (DateTime.UtcNow - _lastKeyframeRequest.Value) < _minKeyframeInterval)
+                    {
+                        return false;
+                    }
+
+                    // 플래그 초기화 및 시간 기록
+                    _forceKeyframe = false;
+                    _lastKeyframeRequest = DateTime.UtcNow;
+                    EnhancedLogger.Instance.Info("키프레임 생성 요청 (네트워크 상태 악화)");
+                    return true;
+                }
+            }
+        }
+
+        /// <summary>
         /// Creates a new instance of the AdaptiveFrameManager
         /// </summary>
         /// <param name="initialFps">Initial frames per second</param>
@@ -86,7 +119,7 @@ namespace ScreenShare.Client.Network
             _adjustmentTimer.Start();
 
             _performanceTimer.Start();
-            FileLogger.Instance.WriteInfo($"AdaptiveFrameManager initialized: FPS={_targetFps}, Quality={_currentQuality}, Bitrate={_currentBitrate/1000}kbps");
+            EnhancedLogger.Instance.Info($"AdaptiveFrameManager initialized: FPS={_targetFps}, Quality={_currentQuality}, Bitrate={_currentBitrate/1000}kbps");
         }
 
         /// <summary>
@@ -223,49 +256,83 @@ namespace ScreenShare.Client.Network
                 int newQuality = _currentQuality;
                 int newBitrate = _currentBitrate;
 
-                // Process network information to determine adjustment strategy
+                // 네트워크 상태 분석 향상
+                bool criticalNetwork = _currentPing > 200 || _packetLoss > 15 || _pendingFrames > _maxPendingFrames * 2;
                 bool poorNetwork = _currentPing > 100 || _packetLoss > 5 || _pendingFrames > _maxPendingFrames;
                 bool goodNetwork = _currentPing < 50 && _packetLoss < 2 && _pendingFrames == 0;
 
-                // Adapt settings based on network conditions
-                if (poorNetwork)
+                // 네트워크 상태에 따른 설정 조정
+                if (criticalNetwork)
                 {
-                    // Reduce quality to maintain responsiveness
+                    // 심각한 네트워크 상태일 때 더 적극적으로 품질 저하
+                    EnhancedLogger.Instance.Warning("심각한 네트워크 상태 감지 - 품질 대폭 저하");
+
+                    // 키프레임 강제 요청
+                    _forceKeyframe = true;
+
                     if (_isRemoteControlActive)
                     {
-                        // In remote control mode, maintain FPS but reduce quality/bitrate
-                        newQuality = Math.Max(_minQuality, _currentQuality - 5);
-                        newBitrate = Math.Max(_minBitrate, (int)(_currentBitrate * 0.8));
+                        // 원격 제어 모드에서는 최소 프레임율 유지하면서 품질/비트레이트 대폭 감소
+                        newFps = Math.Max(_minFps + 5, _targetFps / 2);  // FPS 절반으로 줄이되 최소 상호작용 속도 유지
+                        newQuality = Math.Max(_minQuality, _currentQuality / 2);  // 품질 절반으로
+                        newBitrate = Math.Max(_minBitrate, _currentBitrate / 3);  // 비트레이트 66% 감소
                     }
                     else
                     {
-                        // In viewing mode, reduce both FPS and quality
-                        newFps = Math.Max(_minFps, _targetFps - 2);
-                        newQuality = Math.Max(_minQuality, _currentQuality - 3);
-                        newBitrate = Math.Max(_minBitrate, (int)(_currentBitrate * 0.9));
+                        // 뷰잉 모드에서는 모든 설정 대폭 감소
+                        newFps = Math.Max(_minFps, _targetFps / 2);
+                        newQuality = Math.Max(_minQuality, _currentQuality / 2);
+                        newBitrate = Math.Max(_minBitrate, _currentBitrate / 3);
                     }
 
-                    // Increase flow control tightness
+                    // 흐름 제어 강화
                     _frameThrottling = true;
+                    _maxPendingFrames = 1;
+                }
+                else if (poorNetwork)
+                {
+                    // 좋지 않은 네트워크에서 더 적극적인 품질 조정
+                    if (_isRemoteControlActive)
+                    {
+                        // 원격 제어 모드에서는 FPS 유지하면서 품질/비트레이트 적극 감소
+                        newQuality = Math.Max(_minQuality, _currentQuality - 10);
+                        newBitrate = Math.Max(_minBitrate, (int)(_currentBitrate * 0.7));
+                    }
+                    else
+                    {
+                        // 뷰잉 모드에서는 FPS와 품질 모두 적극 감소
+                        newFps = Math.Max(_minFps, _targetFps - 5);
+                        newQuality = Math.Max(_minQuality, _currentQuality - 8);
+                        newBitrate = Math.Max(_minBitrate, (int)(_currentBitrate * 0.7));
+                    }
+
+                    // 흐름 제어 강화
+                    _frameThrottling = true;
+                    _maxPendingFrames = Math.Max(1, _maxPendingFrames - 1);
                 }
                 else if (goodNetwork && (_isRemoteControlActive || immediate))
                 {
-                    // Gradually improve quality on good network
+                    // 좋은 네트워크에서 점진적 품질 향상
                     if (_isRemoteControlActive)
                     {
-                        // In remote control, prefer higher FPS
+                        // 원격 제어 모드에서는 높은 FPS 선호
                         newFps = Math.Min(_maxFps, _targetFps + 2);
+                        newQuality = Math.Min(_maxQuality, _currentQuality + 1);
                         newBitrate = Math.Min(_maxBitrate, (int)(_currentBitrate * 1.1));
                     }
                     else
                     {
-                        // In viewing mode, prefer higher quality
-                        newQuality = Math.Min(_maxQuality, _currentQuality + 2);
+                        // 뷰잉 모드에서는 높은 품질 선호
+                        newFps = Math.Min(_maxFps, _targetFps + 1);
+                        newQuality = Math.Min(_maxQuality, _currentQuality + 3);
                         newBitrate = Math.Min(_maxBitrate, (int)(_currentBitrate * 1.05));
                     }
+
+                    // 흐름 제어 완화
+                    _maxPendingFrames = Math.Min(3, _maxPendingFrames + 1);
                 }
 
-                // Apply changes if needed
+                // 필요시 변경사항 적용
                 if (newFps != _targetFps)
                 {
                     TargetFps = newFps;
@@ -284,9 +351,10 @@ namespace ScreenShare.Client.Network
                     changed = true;
                 }
 
-                // Notify if settings changed
+                // 설정 변경사항 통지
                 if (changed)
                 {
+                    EnhancedLogger.Instance.Info($"적응형 설정 조정: FPS={_targetFps}, 품질={_currentQuality}, 비트레이트={_currentBitrate/1000}kbps");
                     OnSettingsChanged();
                 }
             }
@@ -301,7 +369,7 @@ namespace ScreenShare.Client.Network
                 Bitrate = _currentBitrate
             };
 
-            FileLogger.Instance.WriteInfo($"Adaptive settings changed: FPS={_targetFps}, Quality={_currentQuality}, Bitrate={_currentBitrate/1000}kbps");
+            EnhancedLogger.Instance.Info($"Adaptive settings changed: FPS={_targetFps}, Quality={_currentQuality}, Bitrate={_currentBitrate/1000}kbps");
             SettingsChanged?.Invoke(this, args);
         }
 
