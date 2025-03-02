@@ -147,7 +147,8 @@ namespace ScreenShare.Host.Forms
                 {
                     try
                     {
-                        BeginInvoke(new Action<Bitmap>(UpdateImage), image);
+                        // Use Invoke instead of BeginInvoke for synchronous execution
+                        Invoke(new Action<Bitmap>(UpdateImage), image);
                         return; // Image will be handled by UI thread
                     }
                     catch (ObjectDisposedException)
@@ -169,27 +170,22 @@ namespace ScreenShare.Host.Forms
                 {
                     try
                     {
-                        // First, nullify the renderer's current image
-                        if (_renderer != null)
-                        {
-                            _renderer.ClearFrame();
-                        }
+                        // Store temporary reference to old frame
+                        var oldFrame = _currentFrame;
 
-                        // Dispose the old image
-                        if (_currentFrame != null && _currentFrame != image)
-                        {
-                            var oldFrame = _currentFrame;
-                            _currentFrame = null;
-                            oldFrame.Dispose();
-                        }
-
-                        // Set the new image
+                        // Set the new image first
                         _currentFrame = image;
 
                         // Render the new image
                         if (_renderer != null && _currentFrame != null && !_isDisposed)
                         {
                             _renderer.RenderFrame(_currentFrame);
+                        }
+
+                        // Only after successful rendering, dispose the old image
+                        if (oldFrame != null && oldFrame != image)
+                        {
+                            oldFrame.Dispose();
                         }
                     }
                     catch (Exception ex)
@@ -199,13 +195,7 @@ namespace ScreenShare.Host.Forms
                         // Cleanup on error
                         try
                         {
-                            if (_currentFrame != null && _currentFrame != image)
-                            {
-                                _currentFrame.Dispose();
-                            }
-                            _currentFrame = null;
-
-                            if (image != null)
+                            if (image != null && image != _currentFrame)
                             {
                                 image.Dispose();
                             }
@@ -220,7 +210,7 @@ namespace ScreenShare.Host.Forms
                 try { image?.Dispose(); } catch { }
             }
         }
-        
+
         private void OnPanelMouseMove(object sender, MouseEventArgs e)
         {
             if (!_isControlling || _currentFrame == null)
